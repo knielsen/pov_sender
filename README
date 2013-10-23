@@ -1,0 +1,9 @@
+Program to read animation frames from 2mbps USB-to-serial and transmit them wirelessly to the POV fan controller using the nRF24L01+ wireless device.
+
+Runs on Tiva TM4C Cortex-M4 microcontroller.
+
+Send packets back-to-back, to maximise the throughput (without
+retransmit, so unreliable transfer similar to UDP).
+Able to get around 195 kbyte/second of payload data throughput.
+
+License: GPL, V2 or later.

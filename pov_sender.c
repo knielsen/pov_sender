@@ -922,6 +922,8 @@ int main()
   uint8_t status;
   uint8_t val;
   uint32_t start, delta;
+  uint8_t startval;
+  static const uint32_t burstsize = 24;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
@@ -959,15 +961,24 @@ int main()
   serial_output_str("\r\n");
   serial_output_str("Done!\r\n");
 
-  serial_output_str("Start timer...\r\n");
-  start = get_time();
-  transmit_multi_packet_start(42, 24, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
-                              GPIO_PORTA_BASE, GPIO_PIN_6,
-                              GPIO_PORTA_BASE, GPIO_PIN_7);
-  transmit_multi_packet_wait();
-  delta = calc_time(start);
-  serial_output_str("Tx: usec=");
-  println_uint32(delta/(MCU_HZ/1000000));
+  startval = 42;
+  for (;;)
+  {
+    serial_output_str("Start timer...\r\n");
+    start = get_time();
+    transmit_multi_packet_start(startval, burstsize,
+                                SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
+                                GPIO_PORTA_BASE, GPIO_PIN_6,
+                                GPIO_PORTA_BASE, GPIO_PIN_7);
+    startval += burstsize;
+    transmit_multi_packet_wait();
+    delta = calc_time(start);
+    serial_output_str("Tx: usec=");
+    println_uint32(delta/(MCU_HZ/1000000));
+    /* Delay 20 usec; hopefully that is enough to take us out of Tx mode. */
+    ROM_SysCtlDelay(MCU_HZ/3/(1000000/20));
+  }
+
   serial_output_str("Done!\r\n");
   for (;;)
     ;

@@ -8,11 +8,14 @@
 #include "inc/hw_ints.h"
 #include "inc/hw_nvic.h"
 #include "inc/hw_ssi.h"
+#include "inc/hw_uart.h"
+#include "inc/hw_timer.h"
 #include "driverlib/gpio.h"
 #include "driverlib/rom.h"
 #include "driverlib/sysctl.h"
 #include "driverlib/sysctl.h"
 #include "driverlib/uart.h"
+#include "driverlib/timer.h"
 #include "driverlib/ssi.h"
 #include "driverlib/udma.h"
 #include "driverlib/systick.h"
@@ -31,6 +34,12 @@
     PA6  CE
     PA7  IRQ
 */
+
+#define SIZEX 65
+#define SIZEY 65
+#define BUF_SIZE ((SIZEX*SIZEY*3+1)/2)
+#define BUF_SIZE_PAD (32*((BUF_SIZE+30)/31))
+#define BURSTSIZE 24
 
 
 /* To change this, must fix clock setup in the code. */
@@ -531,10 +540,11 @@ nrf_read_reg_start(struct nrf_async_cmd *a, uint8_t reg, uint8_t *recvbuf,
 
   The packets are filled in by a call-back function. This callback is invoked
   from interrupt context, so it should ideally be fairly quick and has to be
-  aware of the general interrupt caveats.
+  aware of the general interrupt caveats. A zero return from the callback
+  causes termination of the burst after that packet (irrespectively of count).
 */
 struct nrf_async_transmit_multi {
-  void (*fillpacket)(uint8_t *, void *);
+  int32_t (*fillpacket)(uint8_t *, void *);
   void *cb_data;
   uint32_t ssi_base;
   uint32_t dma_rx_chan, dma_tx_chan;
@@ -567,7 +577,7 @@ nrf_async_transmit_multi_cont(struct nrf_async_transmit_multi *a,
                               uint32_t is_ssi_event);
 static int32_t
 nrf_async_transmit_multi_start(struct nrf_async_transmit_multi *a,
-                               void (*fillpacket)(uint8_t *, void *),
+                               int32_t (*fillpacket)(uint8_t *, void *),
                                void *cb_data, uint32_t count, uint32_t ssi_base,
                                uint32_t dma_rx_chan, uint32_t dma_tx_chan,
                                uint32_t csn_base, uint32_t csn_pin,
@@ -640,7 +650,8 @@ resched:
     }
     --a->remain;
     a->sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
-    (*(a->fillpacket))(&(a->sendbuf[1]), a->cb_data);
+    if (!(*(a->fillpacket))(&(a->sendbuf[1]), a->cb_data))
+      a->remain = 0;                            /* Callback signalled stop. */
     a->transmit_packet_running = 1;
     nrf_async_dma_start(&a->substate.dma, a->recvbuf, a->sendbuf, 33,
                         a->ssi_base, a->dma_rx_chan, a->dma_tx_chan,
@@ -817,8 +828,31 @@ config_interrupts(void)
 }
 
 
+static uint32_t write_sofar;
 static struct nrf_async_transmit_multi transmit_multi_state;
 static volatile uint8_t transmit_multi_running = 0;
+static uint8_t transmit_running = 0;
+
+static void
+handle_end_of_transmit_burst(void)
+{
+  transmit_multi_running = 0;
+  if (write_sofar < BUF_SIZE_PAD)
+  {
+    /*
+      Wait 20 microseconds, then start another write burst.
+      The nRF24L01+ datasheet says that we must not stay in transmit mode
+      for more than 4 milliseconds (which is just a bit more than the time
+      to send 24 full packets back-to-back).
+    */
+    ROM_TimerLoadSet(TIMER2_BASE, TIMER_A, 20*MCU_HZ/1000000);
+    ROM_TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+    ROM_TimerEnable(TIMER2_BASE, TIMER_A);
+  }
+  else
+    transmit_running = 0;
+}
+
 
 void
 IntHandlerGPIOa(void)
@@ -829,7 +863,7 @@ IntHandlerGPIOa(void)
     if (transmit_multi_running)
     {
       if (nrf_async_transmit_multi_cont(&transmit_multi_state, 0))
-        transmit_multi_running = 0;
+        handle_end_of_transmit_burst();
     }
     else
     {
@@ -851,44 +885,23 @@ IntHandlerSSI0(void)
 {
   if (transmit_multi_running &&
       nrf_async_transmit_multi_cont(&transmit_multi_state, 1))
-    transmit_multi_running = 0;
+    handle_end_of_transmit_burst();
 }
 
 
-static void
+static uint8_t frame_buffers[2][BUF_SIZE_PAD];
+static volatile uint32_t write_idx;
+
+static int32_t
 my_fill_packet(uint8_t *buf, void *d)
 {
-  uint8_t *valp = d;
-  uint8_t startval = (*valp)++;
   uint32_t i;
+  uint8_t *src = &frame_buffers[write_idx][write_sofar];
 
   for (i = 0; i < 32; ++i)
-    buf[i] = startval + i;
-}
-
-
-static uint8_t current_startval;
-
-static void
-transmit_multi_packet_start(uint8_t startval, uint32_t count,
-                            uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
-                            uint32_t ce_base, uint32_t ce_pin,
-                            uint32_t irq_base, uint32_t irq_pin)
-{
-  current_startval = startval;
-  transmit_multi_running = 1;
-  nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
-                                 &current_startval, count, ssi_base,
-                                 UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
-                                 csn_base, csn_pin, ce_base, ce_pin,
-                                 irq_base, irq_pin);
-}
-
-static void
-transmit_multi_packet_wait(void)
-{
-  while (transmit_multi_running)
-    ;
+    *buf++ = *src++;
+  write_sofar += 32;
+  return (write_sofar < BUF_SIZE_PAD);
 }
 
 
@@ -917,13 +930,51 @@ calc_time(uint32_t start)
 }
 
 
+void
+IntHandlerTimer2A(void)
+{
+  ROM_TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+  ROM_TimerDisable(TIMER2_BASE, TIMER_A);
+  ROM_TimerIntDisable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+
+  /* Start the next write burst (unless we are done). */
+  if (write_sofar < BUF_SIZE_PAD)
+  {
+    transmit_multi_running = 1;
+    nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
+                                   NULL, BURSTSIZE, SSI0_BASE,
+                                   UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
+                                   GPIO_PORTA_BASE, GPIO_PIN_3,
+                                   GPIO_PORTA_BASE, GPIO_PIN_6,
+                                   GPIO_PORTA_BASE, GPIO_PIN_7);
+  }
+  else
+    transmit_running = 0;
+}
+
+
+static void
+transmit_start(void)
+{
+  transmit_running = 1;
+  write_sofar = 0;
+  transmit_multi_running = 1;
+  nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
+                                 NULL, BURSTSIZE, SSI0_BASE,
+                                 UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
+                                 GPIO_PORTA_BASE, GPIO_PIN_3,
+                                 GPIO_PORTA_BASE, GPIO_PIN_6,
+                                 GPIO_PORTA_BASE, GPIO_PIN_7);
+}
+
+
 int main()
 {
   uint8_t status;
   uint8_t val;
-  uint32_t start, delta;
-  uint8_t startval;
-  static const uint32_t burstsize = 24;
+  uint32_t sofar;
+  uint8_t next_run_num;
+  uint32_t read_idx;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
@@ -938,11 +989,24 @@ int main()
   ROM_GPIOPinConfigure(GPIO_PA1_U0TX);
   ROM_GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
   ROM_UARTConfigSetExpClk(UART0_BASE, (ROM_SysCtlClockGet()), 2000000,
-                      (UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE |
-                       UART_CONFIG_PAR_NONE));
+                          (UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE |
+                           UART_CONFIG_PAR_NONE));
 
   config_ssi_gpio();
   config_spi(SSI0_BASE);
+
+  /*
+    Configure timer interrupt, used to put a small delay between transmit
+    bursts.
+  */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER2);
+  /* Configure 2 * 16-bit timer, A periodic. */
+  ROM_TimerConfigure(TIMER2_BASE, TIMER_CFG_SPLIT_PAIR |
+                     TIMER_CFG_A_ONE_SHOT | TIMER_CFG_B_ONE_SHOT);
+
+  /* Enable interrrupts. */
+  ROM_IntMasterEnable();
+  ROM_IntEnable(INT_TIMER2A);
 
   /* nRF24L01+ datasheet says to wait 100msec for bootup. */
   ROM_SysCtlDelay(MCU_HZ/3/10);
@@ -961,25 +1025,62 @@ int main()
   serial_output_str("\r\n");
   serial_output_str("Done!\r\n");
 
-  startval = 42;
+  sofar = 0;
+  next_run_num = 0;
+  read_idx = 0;
+  write_idx = 1;
   for (;;)
   {
-    serial_output_str("Start timer...\r\n");
-    start = get_time();
-    transmit_multi_packet_start(startval, burstsize,
-                                SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
-                                GPIO_PORTA_BASE, GPIO_PIN_6,
-                                GPIO_PORTA_BASE, GPIO_PIN_7);
-    startval += burstsize;
-    transmit_multi_packet_wait();
-    delta = calc_time(start);
-    serial_output_str("Tx: usec=");
-    println_uint32(delta/(MCU_HZ/1000000));
-    /* Delay 20 usec; hopefully that is enough to take us out of Tx mode. */
-    ROM_SysCtlDelay(MCU_HZ/3/(1000000/20));
-  }
+    uint32_t start_time = get_time();
+    uint8_t val;
 
-  serial_output_str("Done!\r\n");
-  for (;;)
-    ;
+    /* Wait for data, then read from the RX fifo. */
+    while(HWREG(UART0_BASE + UART_O_FR) & UART_FR_RXFE)
+    {
+      /* Simple sync method: if data stream pauses, then reset state. */
+      if (calc_time(start_time) > MCU_HZ/5)
+      {
+        sofar = 0;
+        next_run_num = 0;
+        start_time = get_time();
+      }
+    }
+    if (HWREG(UART0_BASE + UART_O_RSR) & 0x8)
+    {
+      serial_output_str("\r\nRx overrun!\r\n");
+      HWREG(UART0_BASE + UART_O_RSR) = 0;       /* Clear the overrun status */
+    }
+
+    val = HWREG(UART0_BASE + UART_O_DR);
+
+    if ((sofar % 32) == 0)
+    {
+      if (val != next_run_num)
+      {
+        serial_output_str("Corruption, expected: ");
+        println_uint32(next_run_num);
+        serial_output_str("Got: ");
+        println_uint32(val);
+      }
+      ++next_run_num;
+    }
+    frame_buffers[read_idx][sofar++] = val;
+    if (sofar >= BUF_SIZE_PAD)
+    {
+      sofar = 0;
+      next_run_num = 0;
+      if (!transmit_running)
+      {
+        write_idx = read_idx;
+        read_idx = (1 - read_idx);
+        transmit_start();
+      }
+      else
+      {
+        /* If wireless transmit is too slow, we have to skip the frame. */
+        serial_output_str("Skip frame due to previous frame "
+                          "not transmitted.\r\n");
+      }
+    }
+  }
 }

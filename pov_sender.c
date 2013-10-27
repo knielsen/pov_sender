@@ -1014,7 +1014,7 @@ int main()
   serial_output_str("Tx: Setting up...\r\n");
   config_interrupts();
   config_udma_for_spi();
-  nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_18DBM,
+  nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_0DBM,
                   SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
   serial_output_str("Tx: Read CONFIG=0x");
   val = nrf_read_reg(nRF_CONFIG, &status,

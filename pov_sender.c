@@ -27,12 +27,12 @@
   nRF24L01 pinout:
 
   Tx:
-    PA2  SCK        GND *1 2. VCC
-    PA3  CSN        PA6 .3 4. PA3
-    PA4  MISO       PA2 .5 6. PA5
-    PA5  MOSI       PA4 .7 8. PA7
-    PA6  CE
-    PA7  IRQ
+    PF2  SCK        GND *1 2. VCC
+    PF3  CSN        PB3 .3 4. PF3
+    PF0  MISO       PF2 .5 6. PF1
+    PF1  MOSI       PF0 .7 8. PB0
+    PB0  CE
+    PB3  IRQ
 */
 
 #define SIZEX 65
@@ -100,24 +100,24 @@ println_uint32(uint32_t val)
 static void
 config_ssi_gpio(void)
 {
-  /* Config Tx on SSI0, PA2-PA7 */
-  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI0);
-  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+  /* Config Tx on SSI1, PF0-PF3 + PB0/PB3. */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI1);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
 
-  ROM_GPIOPinConfigure(GPIO_PA2_SSI0CLK);
-  ROM_GPIOPinConfigure(GPIO_PA4_SSI0RX);
-  ROM_GPIOPinConfigure(GPIO_PA5_SSI0TX);
-  ROM_GPIOPinTypeSSI(GPIO_PORTA_BASE, GPIO_PIN_2 | GPIO_PIN_4 | GPIO_PIN_5);
+  ROM_GPIOPinConfigure(GPIO_PF2_SSI1CLK);
+  ROM_GPIOPinConfigure(GPIO_PF0_SSI1RX);
+  ROM_GPIOPinConfigure(GPIO_PF1_SSI1TX);
+  ROM_GPIOPinTypeSSI(GPIO_PORTF_BASE, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2);
   /* CSN pin, high initially */
-  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_3);
-  ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_3, GPIO_PIN_3);
+  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_3);
+  ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, GPIO_PIN_3);
   /* CE pin, low initially */
-  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
-  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_6);
-  ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_0);
+  ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_0, 0);
   /* IRQ pin as input. */
-  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
-  ROM_GPIOPinTypeGPIOInput(GPIO_PORTA_BASE, GPIO_PIN_7);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+  ROM_GPIOPinTypeGPIOInput(GPIO_PORTB_BASE, GPIO_PIN_3);
 }
 
 
@@ -150,23 +150,23 @@ config_udma_for_spi(void)
   ROM_uDMAEnable();
   ROM_uDMAControlBaseSet(udma_control_block);
 
-  ROM_SSIDMAEnable(SSI0_BASE, SSI_DMA_TX);
-  ROM_SSIDMAEnable(SSI0_BASE, SSI_DMA_RX);
-  ROM_IntEnable(INT_SSI0);
+  ROM_SSIDMAEnable(SSI1_BASE, SSI_DMA_TX);
+  ROM_SSIDMAEnable(SSI1_BASE, SSI_DMA_RX);
+  ROM_IntEnable(INT_SSI1);
 
-  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI0TX, UDMA_ATTR_ALTSELECT |
+  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI1TX, UDMA_ATTR_ALTSELECT |
                                   UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
-  ROM_uDMAChannelAssign(UDMA_CH11_SSI0TX);
-  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI0TX, UDMA_ATTR_USEBURST);
-  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI0TX | UDMA_PRI_SELECT,
+  ROM_uDMAChannelAssign(UDMA_CH25_SSI1TX);
+  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI1TX, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI1TX | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
                             UDMA_ARB_4);
 
-  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI0RX, UDMA_ATTR_ALTSELECT |
+  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI1RX, UDMA_ATTR_ALTSELECT |
                                   UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
-  ROM_uDMAChannelAssign(UDMA_CH10_SSI0RX);
-  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI0RX, UDMA_ATTR_USEBURST);
-  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI0RX | UDMA_PRI_SELECT,
+  ROM_uDMAChannelAssign(UDMA_CH24_SSI1RX);
+  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI1RX, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI1RX | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_DST_INC_8 | UDMA_SRC_INC_NONE |
                             UDMA_ARB_4);
 }
@@ -822,9 +822,9 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
 static void
 config_interrupts(void)
 {
-  ROM_GPIOIntTypeSet(GPIO_PORTA_BASE, GPIO_PIN_7, GPIO_LOW_LEVEL);
+  ROM_GPIOIntTypeSet(GPIO_PORTB_BASE, GPIO_PIN_3, GPIO_LOW_LEVEL);
   ROM_IntMasterEnable();
-  ROM_IntEnable(INT_GPIOA);
+  ROM_IntEnable(INT_GPIOB);
 }
 
 
@@ -855,10 +855,10 @@ handle_end_of_transmit_burst(void)
 
 
 void
-IntHandlerGPIOa(void)
+IntHandlerGPIOb(void)
 {
-  uint32_t irq_status = HWREG(GPIO_PORTA_BASE + GPIO_O_MIS) & 0xff;
-  if (irq_status & GPIO_PIN_7)
+  uint32_t irq_status = HWREG(GPIO_PORTB_BASE + GPIO_O_MIS) & 0xff;
+  if (irq_status & GPIO_PIN_3)
   {
     if (transmit_multi_running)
     {
@@ -871,8 +871,8 @@ IntHandlerGPIOa(void)
         Clear the interrupt request and disable further interrupts until we can
         clear the request from the device over SPI.
       */
-      HWREG(GPIO_PORTA_BASE + GPIO_O_IM) &= ~GPIO_PIN_7 & 0xff;
-      HWREG(GPIO_PORTA_BASE + GPIO_O_ICR) = GPIO_PIN_7;
+      HWREG(GPIO_PORTB_BASE + GPIO_O_IM) &= ~GPIO_PIN_3 & 0xff;
+      HWREG(GPIO_PORTB_BASE + GPIO_O_ICR) = GPIO_PIN_3;
 
       serial_output_str("Tx: IRQ: TX_DS (spurious)\r\n");
     }
@@ -881,7 +881,7 @@ IntHandlerGPIOa(void)
 
 
 void
-IntHandlerSSI0(void)
+IntHandlerSSI1(void)
 {
   if (transmit_multi_running &&
       nrf_async_transmit_multi_cont(&transmit_multi_state, 1))
@@ -942,11 +942,11 @@ IntHandlerTimer2A(void)
   {
     transmit_multi_running = 1;
     nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
-                                   NULL, BURSTSIZE, SSI0_BASE,
-                                   UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
-                                   GPIO_PORTA_BASE, GPIO_PIN_3,
-                                   GPIO_PORTA_BASE, GPIO_PIN_6,
-                                   GPIO_PORTA_BASE, GPIO_PIN_7);
+                                   NULL, BURSTSIZE, SSI1_BASE,
+                                   UDMA_CHANNEL_SSI1RX, UDMA_CHANNEL_SSI1TX,
+                                   GPIO_PORTF_BASE, GPIO_PIN_3,
+                                   GPIO_PORTB_BASE, GPIO_PIN_0,
+                                   GPIO_PORTB_BASE, GPIO_PIN_3);
   }
   else
     transmit_running = 0;
@@ -960,11 +960,11 @@ transmit_start(void)
   write_sofar = 0;
   transmit_multi_running = 1;
   nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
-                                 NULL, BURSTSIZE, SSI0_BASE,
-                                 UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
-                                 GPIO_PORTA_BASE, GPIO_PIN_3,
-                                 GPIO_PORTA_BASE, GPIO_PIN_6,
-                                 GPIO_PORTA_BASE, GPIO_PIN_7);
+                                 NULL, BURSTSIZE, SSI1_BASE,
+                                 UDMA_CHANNEL_SSI1RX, UDMA_CHANNEL_SSI1TX,
+                                 GPIO_PORTF_BASE, GPIO_PIN_3,
+                                 GPIO_PORTB_BASE, GPIO_PIN_0,
+                                 GPIO_PORTB_BASE, GPIO_PIN_3);
 }
 
 
@@ -993,7 +993,7 @@ int main()
                            UART_CONFIG_PAR_NONE));
 
   config_ssi_gpio();
-  config_spi(SSI0_BASE);
+  config_spi(SSI1_BASE);
 
   /*
     Configure timer interrupt, used to put a small delay between transmit
@@ -1015,10 +1015,10 @@ int main()
   config_interrupts();
   config_udma_for_spi();
   nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_0DBM,
-                  SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
+                  SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
   serial_output_str("Tx: Read CONFIG=0x");
   val = nrf_read_reg(nRF_CONFIG, &status,
-                     SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
+                     SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
   serial_output_hexbyte(val);
   serial_output_str(" status=0x");
   serial_output_hexbyte(status);
@@ -1034,6 +1034,7 @@ int main()
     uint32_t start_time = get_time();
     uint8_t val;
 
+ROM_UARTCharPut(UART0_BASE, '.');
     /* Wait for data, then read from the RX fifo. */
     while(HWREG(UART0_BASE + UART_O_FR) & UART_FR_RXFE)
     {

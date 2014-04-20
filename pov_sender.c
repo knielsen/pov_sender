@@ -31,8 +31,8 @@
     PF3  CSN        PB3 .3 4. PF3
     PF0  MISO       PF2 .5 6. PF1
     PF1  MOSI       PF0 .7 8. PB0
-    PB0  CE
-    PB3  IRQ
+    PB0  IRQ
+    PB3  CE
 */
 
 #define SIZEX 65
@@ -118,11 +118,11 @@ config_ssi_gpio(void)
   ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, GPIO_PIN_3);
   /* CE pin, low initially */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_0);
-  ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_0, 0);
+  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_3);
+  ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3, 0);
   /* IRQ pin as input. */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-  ROM_GPIOPinTypeGPIOInput(GPIO_PORTB_BASE, GPIO_PIN_3);
+  ROM_GPIOPinTypeGPIOInput(GPIO_PORTB_BASE, GPIO_PIN_0);
 }
 
 
@@ -827,7 +827,7 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
 static void
 config_interrupts(void)
 {
-  ROM_GPIOIntTypeSet(GPIO_PORTB_BASE, GPIO_PIN_3, GPIO_LOW_LEVEL);
+  ROM_GPIOIntTypeSet(GPIO_PORTB_BASE, GPIO_PIN_0, GPIO_LOW_LEVEL);
   ROM_IntMasterEnable();
   ROM_IntEnable(INT_GPIOB);
 }
@@ -863,7 +863,7 @@ void
 IntHandlerGPIOb(void)
 {
   uint32_t irq_status = HWREG(GPIO_PORTB_BASE + GPIO_O_MIS) & 0xff;
-  if (irq_status & GPIO_PIN_3)
+  if (irq_status & GPIO_PIN_0)
   {
     if (transmit_multi_running)
     {
@@ -876,8 +876,8 @@ IntHandlerGPIOb(void)
         Clear the interrupt request and disable further interrupts until we can
         clear the request from the device over SPI.
       */
-      HWREG(GPIO_PORTB_BASE + GPIO_O_IM) &= ~GPIO_PIN_3 & 0xff;
-      HWREG(GPIO_PORTB_BASE + GPIO_O_ICR) = GPIO_PIN_3;
+      HWREG(GPIO_PORTB_BASE + GPIO_O_IM) &= ~GPIO_PIN_0 & 0xff;
+      HWREG(GPIO_PORTB_BASE + GPIO_O_ICR) = GPIO_PIN_0;
 
       serial_output_str("Tx: IRQ: TX_DS (spurious)\r\n");
     }
@@ -950,8 +950,8 @@ IntHandlerTimer2A(void)
                                    NULL, BURSTSIZE, SSI1_BASE,
                                    UDMA_CHANNEL_SSI1RX, UDMA_CHANNEL_SSI1TX,
                                    GPIO_PORTF_BASE, GPIO_PIN_3,
-                                   GPIO_PORTB_BASE, GPIO_PIN_0,
-                                   GPIO_PORTB_BASE, GPIO_PIN_3);
+                                   GPIO_PORTB_BASE, GPIO_PIN_3,
+                                   GPIO_PORTB_BASE, GPIO_PIN_0);
   }
   else
     transmit_running = 0;
@@ -968,8 +968,8 @@ transmit_start(void)
                                  NULL, BURSTSIZE, SSI1_BASE,
                                  UDMA_CHANNEL_SSI1RX, UDMA_CHANNEL_SSI1TX,
                                  GPIO_PORTF_BASE, GPIO_PIN_3,
-                                 GPIO_PORTB_BASE, GPIO_PIN_0,
-                                 GPIO_PORTB_BASE, GPIO_PIN_3);
+                                 GPIO_PORTB_BASE, GPIO_PIN_3,
+                                 GPIO_PORTB_BASE, GPIO_PIN_0);
 }
 
 
@@ -1039,7 +1039,6 @@ int main()
     uint32_t start_time = get_time();
     uint8_t val;
 
-ROM_UARTCharPut(UART0_BASE, '.');
     /* Wait for data, then read from the RX fifo. */
     while(HWREG(UART0_BASE + UART_O_FR) & UART_FR_RXFE)
     {

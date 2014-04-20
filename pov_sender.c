@@ -104,6 +104,11 @@ config_ssi_gpio(void)
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI1);
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
 
+  /* PF0 is special (NMI), needs unlock to be re-assigned to SSI1. */
+  HWREG(GPIO_PORTF_BASE + GPIO_O_LOCK) = GPIO_LOCK_KEY_DD;
+  HWREG(GPIO_PORTF_BASE + GPIO_O_CR) |= 0x01;
+  HWREG(GPIO_PORTF_BASE + GPIO_O_LOCK) = 0;
+
   ROM_GPIOPinConfigure(GPIO_PF2_SSI1CLK);
   ROM_GPIOPinConfigure(GPIO_PF0_SSI1RX);
   ROM_GPIOPinConfigure(GPIO_PF1_SSI1TX);

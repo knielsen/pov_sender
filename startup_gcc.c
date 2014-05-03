@@ -38,6 +38,7 @@ static void IntDefaultHandler(void);
 extern void IntHandlerGPIOb(void);
 extern void IntHandlerSSI1(void);
 extern void IntHandlerTimer2A(void);
+extern void USB0DeviceIntHandler(void);
 
 //*****************************************************************************
 //
@@ -123,7 +124,7 @@ void (* const g_pfnVectors[])(void) =
     IntDefaultHandler,                      // CAN2
     IntDefaultHandler,                      // Ethernet
     IntDefaultHandler,                      // Hibernate
-    IntDefaultHandler,                      // USB0
+    USB0DeviceIntHandler,                   // USB0
     IntDefaultHandler,                      // PWM Generator 3
     IntDefaultHandler,                      // uDMA Software Transfer
     IntDefaultHandler,                      // uDMA Error

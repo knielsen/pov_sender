@@ -7,3 +7,54 @@ retransmit, so unreliable transfer similar to UDP).
 Able to get around 195 kbyte/second of payload data throughput.
 
 License: GPL, V2 or later.
+
+-----------------------------------------------------------------------
+Protocol description:
+
+Data is sent from pov_sender to the POV control board over nRF24L01+ in 32-byte packets.
+The first byte T identifies the kind of packet.
+
+If the value is 0 <= T <= 204, then the packet contains frame buffer data. The remaning 31 bytes are data to be loaded into the frame buffer, at offset (T*31).
+
+If the value is T=255, then it is a command packet. Format of this to be determined.
+
+If the value is T=254, then it is a debug packet. This is used to program the
+flash on the POV control board, over wireless. The second byte U is a sub-type
+for debug packet:
+
+  0 <= U <= 34  The remainder of the packet is data to be loaded into a
+                1024-byte flash buffer at offset U*30. There is no U=240
+                status reply for this packet.
+
+  U = 240       Bootloader status; this packet is sent from bootloader to
+                pov_sender as a reply as noted for specific commands; for
+                these commands the pov_sender must switch to receive mode and
+                wait for the reply. The third byte of this packet is either
+                zero for ok or else an error code.
+
+  U = 252       Flash. This instructs the bootloader to write the contents of
+                the 1024-byte flash buffer to flash. The destination is
+                identified with a block number stored in the following 4
+                bytes, little-endian; the address written starts at
+                1024*blocknum. The bootloader sends a U=240 status reply when
+                done.
+
+  U = 253       Reset; the bootloader sends a U=240 status reply and transfers
+                control to the target application.
+
+  U = 254       Enter bootloader. If the bootloader receives this within 1
+                second of reset, it replies with a T=254,U=240 packet and
+                remains in bootloader mode for more commands; else it starts
+                the POV application after 1 second.
+
+  U = 255       Reset the control board and enter the bootloader.
+
+-----------------------------------------------------------------------
+Communication over USB.
+
+The pov_sender emulates a /dev/ttyACM0 USB-to-serial adapter. Packet data is
+sent via this device, and status information is read back.
+
+Data is sent as raw bytes, 32 for each packet. Synchronisation is time-based;
+if no data is received within 0.2 seconds, then the connection is reset, and
+any later data is assumed to start a new packet.

@@ -48,6 +48,10 @@
 #define BURSTSIZE 24
 
 
+/* Communications protocol. */
+#define POV_CMD_DEBUG 254
+
+
 /* To change this, must fix clock setup in the code. */
 #define MCU_HZ 80000000
 
@@ -1092,6 +1096,8 @@ resched:
 }
 
 
+static const uint8_t nrf_addr[3] = { 0xe7, 0xe7, 0xe7 };
+
 /*
   Configure nRF24L01+ as Rx or Tx.
     channel - radio frequency channel to use, 0 <= channel <= 127.
@@ -1101,8 +1107,6 @@ static void
 nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
                 uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 {
-  static const uint8_t addr[3] = { 0xe7, 0xe7, 0xe7 };
-
   if (is_rx)
     nrf_write_reg(nRF_CONFIG, nRF_PRIM_RX | nRF_MASK_TX_DS |
                   nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
@@ -1123,19 +1127,101 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
   /* Use 2Mbps, and set transmit power. */
   nrf_write_reg(nRF_RF_SETUP, nRF_RF_DR_HIGH | power,
                 ssi_base, csn_base, csn_pin);
-  nrf_write_reg_n(nRF_RX_ADDR_P0, addr, 3, ssi_base, csn_base, csn_pin);
-  nrf_write_reg_n(nRF_TX_ADDR, addr, 3, ssi_base, csn_base, csn_pin);
+  nrf_write_reg_n(nRF_RX_ADDR_P0, nrf_addr, 3, ssi_base, csn_base, csn_pin);
+  nrf_write_reg_n(nRF_TX_ADDR, nrf_addr, 3, ssi_base, csn_base, csn_pin);
   /* Set payload size for pipe 0. */
-  if (is_rx)
-    nrf_write_reg(nRF_RX_PW_P0, 32, ssi_base, csn_base, csn_pin);
-  else
-    nrf_write_reg(nRF_RX_PW_P0, 8, ssi_base, csn_base, csn_pin);
+  nrf_write_reg(nRF_RX_PW_P0, 32, ssi_base, csn_base, csn_pin);
   /* Disable pipe 1-5. */
   nrf_write_reg(nRF_RX_PW_P1, 0, ssi_base, csn_base, csn_pin);
   /* Disable dynamic payload length. */
   nrf_write_reg(nRF_DYNDP, 0, ssi_base, csn_base, csn_pin);
   /* Allow disabling acks. */
   nrf_write_reg(nRF_FEATURE, nRF_EN_DYN_ACK, ssi_base, csn_base, csn_pin);
+
+  /* Clear out all FIFOs. */
+  nrf_flush_tx(ssi_base, csn_base, csn_pin);
+  nrf_flush_rx(ssi_base, csn_base, csn_pin);
+  /* Clear the IRQ bits in STATUS register. */
+  nrf_write_reg(nRF_STATUS, nRF_RX_DR|nRF_TX_DS|nRF_MAX_RT,
+                ssi_base, csn_base, csn_pin);
+}
+
+
+/*
+  Configure nRF24L01+ as Tx for streaming frame buffer data back-to-back
+  as fast as possible.
+
+  The nRF24L01+ is configured as transmitter, with auto-ack and
+  retransmission disabled.
+*/
+static void
+nrf_config_normal_tx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  nrf_write_reg(nRF_CONFIG, nRF_MASK_RX_DR |
+                  nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                  ssi_base, csn_base, csn_pin);
+  /* Disable auto-ack, saving 9 bits/packet. Else 0x3f. */
+  nrf_write_reg(nRF_EN_AA, 0, ssi_base, csn_base, csn_pin);
+  /* Disable auto retransmit. */
+  nrf_write_reg(nRF_SETUP_RETR, 0, ssi_base, csn_base, csn_pin);
+
+  /* Clear out all FIFOs. */
+  nrf_flush_tx(ssi_base, csn_base, csn_pin);
+  nrf_flush_rx(ssi_base, csn_base, csn_pin);
+  /* Clear the IRQ bits in STATUS register. */
+  nrf_write_reg(nRF_STATUS, nRF_RX_DR|nRF_TX_DS|nRF_MAX_RT,
+                ssi_base, csn_base, csn_pin);
+}
+
+
+/*
+  Configure nRF24L01+ as Tx for talking to the bootloader.
+
+  The nRF24L01+ is configured as transmitter, with auto-ack and
+  retransmission enabled.
+*/
+static void
+nrf_config_bootload_tx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  nrf_write_reg(nRF_CONFIG, nRF_MASK_RX_DR |
+                  nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                  ssi_base, csn_base, csn_pin);
+  /* Enable auto-ack. */
+  nrf_write_reg(nRF_EN_AA, nRF_ENAA_P0|nRF_ENAA_P1|nRF_ENAA_P2|
+                           nRF_ENAA_P3|nRF_ENAA_P4|nRF_ENAA_P5,
+                ssi_base, csn_base, csn_pin);
+  /* Enable auto retransmit. */
+  nrf_write_reg(nRF_SETUP_RETR, (1 << nRF_ARD_SHIFT) | 15,
+                ssi_base, csn_base, csn_pin);
+
+  /* Clear out all FIFOs. */
+  nrf_flush_tx(ssi_base, csn_base, csn_pin);
+  nrf_flush_rx(ssi_base, csn_base, csn_pin);
+  /* Clear the IRQ bits in STATUS register. */
+  nrf_write_reg(nRF_STATUS, nRF_RX_DR|nRF_TX_DS|nRF_MAX_RT,
+                ssi_base, csn_base, csn_pin);
+}
+
+
+/*
+  Configure nRF24L01+ as Rx for getting reply packet from the bootloader.
+
+  The nRF24L01+ is configured as receiver, with auto-ack and
+  retransmission enabled.
+*/
+static void
+nrf_config_bootload_rx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  nrf_write_reg(nRF_CONFIG, nRF_PRIM_RX | nRF_MASK_RX_DR |
+                  nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                  ssi_base, csn_base, csn_pin);
+  /* Enable auto-ack. */
+  nrf_write_reg(nRF_EN_AA, nRF_ENAA_P0|nRF_ENAA_P1|nRF_ENAA_P2|
+                           nRF_ENAA_P3|nRF_ENAA_P4|nRF_ENAA_P5,
+                ssi_base, csn_base, csn_pin);
+  /* Enable auto retransmit. */
+  nrf_write_reg(nRF_SETUP_RETR, (1 << nRF_ARD_SHIFT) | 15,
+                ssi_base, csn_base, csn_pin);
 
   /* Clear out all FIFOs. */
   nrf_flush_tx(ssi_base, csn_base, csn_pin);
@@ -1295,6 +1381,67 @@ transmit_start(void)
 }
 
 
+static void
+handle_cmd_debug(uint8_t val)
+{
+  /*
+    Hm. At some point I need to implement that I can send the DEBUG START
+    command to lm4f_pov.
+
+    And I need to wait for existing transfer to stop before doing more with
+    nRF24L01+. Not sure if I should disable interrupts, or if I should use
+    existing interrupt/dma routines.
+  */
+  nrf_config_bootload_tx(SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+
+
+  nrf_config_normal_tx(SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+}
+
+
+/*
+  Read a packet from USB. A packet is 32 bytes of data.
+
+  Handles sync-up by resetting the state (and resetting the packet buffer to
+  empty) whenever more than 0.2 seconds pass without any data received.
+
+  Returns a true value if a reset was done, false if not.
+*/
+static uint32_t
+usb_get_packet(uint8_t *packet_buf)
+{
+  uint32_t reset = 0;
+  uint32_t sofar = 0;
+  uint32_t start_time;
+  uint8_t val;
+  uint32_t h, t;
+
+  while (sofar < 32)
+  {
+    t = recvbuf.tail;
+    start_time = get_time();
+    while ((h = recvbuf.head) == t)
+    {
+      /* Simple sync method: if data stream pauses, then reset state. */
+      if (calc_time(start_time) > MCU_HZ/5)
+      {
+        sofar = 0;
+        reset = 1;
+        start_time = get_time();
+      }
+    }
+    val = recvbuf.buf[t];
+    ++t;
+    if (t >= RECV_BUF_SIZE)
+      t = 0;
+    recvbuf.tail = t;
+    packet_buf[sofar++] = val;
+  }
+
+  return reset;
+}
+
+
 int main()
 {
   uint8_t status;
@@ -1302,6 +1449,7 @@ int main()
   uint32_t sofar;
   uint8_t next_run_num;
   uint32_t read_idx;
+  uint32_t corruption_flag;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
@@ -1363,45 +1511,53 @@ int main()
 
   sofar = 0;
   next_run_num = 0;
+  corruption_flag = 1;
   read_idx = 0;
   write_idx = 1;
   for (;;)
   {
-    uint32_t start_time = get_time();
+    uint32_t i;
     uint8_t val;
-    uint32_t h, t;
+    uint8_t usb_packet[32];
 
-    /* Wait for data, then read from the RX fifo. */
-    t = recvbuf.tail;
-    while((h = recvbuf.head) == t)
+    /* Wait for a packet on the USB. */
+    if (usb_get_packet(usb_packet))
     {
-      /* Simple sync method: if data stream pauses, then reset state. */
-      if (calc_time(start_time) > MCU_HZ/5)
-      {
-        sofar = 0;
-        next_run_num = 0;
-        start_time = get_time();
-      }
+      /*
+        If we had a resync on the USB, then reset the frame packet count.
+        We do not want to transmit a half-received frame to the POV.
+      */
+      next_run_num = 0;
+    }
+    val = usb_packet[0];
+
+    if (val == POV_CMD_DEBUG)
+    {
+      handle_cmd_debug(val);
+      continue;
     }
 
-    val = recvbuf.buf[t];
-    ++t;
-    if (t >= RECV_BUF_SIZE)
-      t = 0;
-    recvbuf.tail = t;
-
-    if ((sofar % 32) == 0)
+    if (val != next_run_num)
     {
-      if (val != next_run_num)
+      if (!corruption_flag)
       {
         serial_output_str("Corruption, expected: ");
         println_uint32(next_run_num);
         serial_output_str("Got: ");
         println_uint32(val);
+        /* Let's silently skip everything until start of next frame. */
+        corruption_flag = 1;
+        next_run_num = 0;
       }
-      ++next_run_num;
+      continue;
     }
-    frame_buffers[read_idx][sofar++] = val;
+    else
+      corruption_flag = 0;
+    ++next_run_num;
+
+    /* Copy the packet into the frame buffer for later bulk sending. */
+    for (i = 0; i < 32; ++i)
+      frame_buffers[read_idx][sofar++] = usb_packet[i];
     if (sofar >= BUF_SIZE_PAD)
     {
       sofar = 0;

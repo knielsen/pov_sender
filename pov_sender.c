@@ -48,8 +48,28 @@
 #define BURSTSIZE 24
 
 
+/*
+  Note that to change these, may require additional changes in
+  config_ssi_gpio() and in IRQ handler setup.
+*/
+#define NRF_SSI_BASE SSI1_BASE
+#define NRF_CSN_BASE GPIO_PORTF_BASE
+#define NRF_CSN_PIN GPIO_PIN_3
+#define NRF_CE_BASE GPIO_PORTB_BASE
+#define NRF_CE_PIN GPIO_PIN_3
+#define NRF_IRQ_BASE GPIO_PORTB_BASE
+#define NRF_IRQ_PIN GPIO_PIN_0
+#define NRF_DMA_CH_RX UDMA_CHANNEL_SSI1RX
+#define NRF_DMA_CH_TX UDMA_CHANNEL_SSI1TX
+
+
 /* Communications protocol. */
 #define POV_CMD_DEBUG 254
+#define POV_SUBCMD_RESET_TO_BOOTLOADER 255
+#define POV_SUBCMD_ENTER_BOOTLOADER 254
+#define POV_SUBCMD_RESET_TO_APP 253
+#define POV_SUBCMD_FLASH_BUFFER 252
+#define POV_SUBCMD_STATUS_REPLY 240
 
 
 /* To change this, must fix clock setup in the code. */
@@ -440,15 +460,15 @@ config_ssi_gpio(void)
   ROM_GPIOPinConfigure(GPIO_PF1_SSI1TX);
   ROM_GPIOPinTypeSSI(GPIO_PORTF_BASE, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2);
   /* CSN pin, high initially */
-  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_3);
-  ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, GPIO_PIN_3);
+  ROM_GPIOPinTypeGPIOOutput(NRF_CSN_BASE, NRF_CSN_PIN);
+  ROM_GPIOPinWrite(NRF_CSN_BASE, NRF_CSN_PIN, NRF_CSN_PIN);
   /* CE pin, low initially */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_3);
-  ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_3, 0);
+  ROM_GPIOPinTypeGPIOOutput(NRF_CE_BASE, NRF_CE_PIN);
+  ROM_GPIOPinWrite(NRF_CE_BASE, NRF_CE_PIN, 0);
   /* IRQ pin as input. */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-  ROM_GPIOPinTypeGPIOInput(GPIO_PORTB_BASE, GPIO_PIN_0);
+  ROM_GPIOPinTypeGPIOInput(NRF_IRQ_BASE, NRF_IRQ_PIN);
 }
 
 
@@ -481,23 +501,23 @@ config_udma_for_spi(void)
   ROM_uDMAEnable();
   ROM_uDMAControlBaseSet(udma_control_block);
 
-  ROM_SSIDMAEnable(SSI1_BASE, SSI_DMA_TX);
-  ROM_SSIDMAEnable(SSI1_BASE, SSI_DMA_RX);
+  ROM_SSIDMAEnable(NRF_SSI_BASE, SSI_DMA_TX);
+  ROM_SSIDMAEnable(NRF_SSI_BASE, SSI_DMA_RX);
   ROM_IntEnable(INT_SSI1);
 
-  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI1TX, UDMA_ATTR_ALTSELECT |
+  ROM_uDMAChannelAttributeDisable(NRF_DMA_CH_TX, UDMA_ATTR_ALTSELECT |
                                   UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
   ROM_uDMAChannelAssign(UDMA_CH25_SSI1TX);
-  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI1TX, UDMA_ATTR_USEBURST);
-  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI1TX | UDMA_PRI_SELECT,
+  ROM_uDMAChannelAttributeEnable(NRF_DMA_CH_TX, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(NRF_DMA_CH_TX | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
                             UDMA_ARB_4);
 
-  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI1RX, UDMA_ATTR_ALTSELECT |
+  ROM_uDMAChannelAttributeDisable(NRF_DMA_CH_RX, UDMA_ATTR_ALTSELECT |
                                   UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
   ROM_uDMAChannelAssign(UDMA_CH24_SSI1RX);
-  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI1RX, UDMA_ATTR_USEBURST);
-  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI1RX | UDMA_PRI_SELECT,
+  ROM_uDMAChannelAttributeEnable(NRF_DMA_CH_RX, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(NRF_DMA_CH_RX | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_DST_INC_8 | UDMA_SRC_INC_NONE |
                             UDMA_ARB_4);
 }
@@ -563,6 +583,49 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 
   /* Take CSN high to complete transfer. */
   csn_high(csn_base, csn_pin);
+}
+
+
+static void
+nrf_rx(uint8_t *data, uint32_t len,
+       uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[33], recvbuf[33];
+
+  if (len > 32)
+    len = 32;
+  sendbuf[0] = nRF_R_RX_PAYLOAD;
+  bzero(&sendbuf[1], len);
+  ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
+  memcpy(data, &recvbuf[1], len);
+}
+
+
+static void
+nrf_tx(uint8_t *data, uint32_t len,
+       uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[33], recvbuf[33];
+
+  if (len > 32)
+    len = 32;
+  sendbuf[0] = nRF_W_TX_PAYLOAD;
+  memcpy(&sendbuf[1], data, len);
+  ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
+}
+
+
+static void
+nrf_tx_nack(uint8_t *data, uint32_t len,
+            uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[33], recvbuf[33];
+
+  if (len > 32)
+    len = 32;
+  sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
+  memcpy(&sendbuf[1], data, len);
+  ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
 }
 
 
@@ -1235,7 +1298,7 @@ nrf_config_bootload_rx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 static void
 config_interrupts(void)
 {
-  ROM_GPIOIntTypeSet(GPIO_PORTB_BASE, GPIO_PIN_0, GPIO_LOW_LEVEL);
+  ROM_GPIOIntTypeSet(NRF_IRQ_BASE, NRF_IRQ_PIN, GPIO_LOW_LEVEL);
   ROM_IntMasterEnable();
   ROM_IntEnable(INT_GPIOB);
 }
@@ -1244,7 +1307,7 @@ config_interrupts(void)
 static uint32_t write_sofar;
 static struct nrf_async_transmit_multi transmit_multi_state;
 static volatile uint8_t transmit_multi_running = 0;
-static uint8_t transmit_running = 0;
+static volatile uint8_t transmit_running = 0;
 
 static void
 handle_end_of_transmit_burst(void)
@@ -1271,7 +1334,7 @@ void
 IntHandlerGPIOb(void)
 {
   uint32_t irq_status = HWREG(GPIO_PORTB_BASE + GPIO_O_MIS) & 0xff;
-  if (irq_status & GPIO_PIN_0)
+  if (irq_status & NRF_IRQ_PIN)
   {
     if (transmit_multi_running)
     {
@@ -1284,8 +1347,8 @@ IntHandlerGPIOb(void)
         Clear the interrupt request and disable further interrupts until we can
         clear the request from the device over SPI.
       */
-      HWREG(GPIO_PORTB_BASE + GPIO_O_IM) &= ~GPIO_PIN_0 & 0xff;
-      HWREG(GPIO_PORTB_BASE + GPIO_O_ICR) = GPIO_PIN_0;
+      HWREG(GPIO_PORTB_BASE + GPIO_O_IM) &= ~NRF_IRQ_PIN & 0xff;
+      HWREG(GPIO_PORTB_BASE + GPIO_O_ICR) = NRF_IRQ_PIN;
 
       serial_output_str("Tx: IRQ: TX_DS (spurious)\r\n");
     }
@@ -1355,11 +1418,11 @@ IntHandlerTimer2A(void)
   {
     transmit_multi_running = 1;
     nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
-                                   NULL, BURSTSIZE, SSI1_BASE,
-                                   UDMA_CHANNEL_SSI1RX, UDMA_CHANNEL_SSI1TX,
-                                   GPIO_PORTF_BASE, GPIO_PIN_3,
-                                   GPIO_PORTB_BASE, GPIO_PIN_3,
-                                   GPIO_PORTB_BASE, GPIO_PIN_0);
+                                   NULL, BURSTSIZE, NRF_SSI_BASE,
+                                   NRF_DMA_CH_RX, NRF_DMA_CH_TX,
+                                   NRF_CSN_BASE, NRF_CSN_PIN,
+                                   NRF_CE_BASE, NRF_CE_PIN,
+                                   NRF_IRQ_BASE, NRF_IRQ_PIN);
   }
   else
     transmit_running = 0;
@@ -1373,29 +1436,11 @@ transmit_start(void)
   write_sofar = 0;
   transmit_multi_running = 1;
   nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
-                                 NULL, BURSTSIZE, SSI1_BASE,
-                                 UDMA_CHANNEL_SSI1RX, UDMA_CHANNEL_SSI1TX,
-                                 GPIO_PORTF_BASE, GPIO_PIN_3,
-                                 GPIO_PORTB_BASE, GPIO_PIN_3,
-                                 GPIO_PORTB_BASE, GPIO_PIN_0);
-}
-
-
-static void
-handle_cmd_debug(uint8_t val)
-{
-  /*
-    Hm. At some point I need to implement that I can send the DEBUG START
-    command to lm4f_pov.
-
-    And I need to wait for existing transfer to stop before doing more with
-    nRF24L01+. Not sure if I should disable interrupts, or if I should use
-    existing interrupt/dma routines.
-  */
-  nrf_config_bootload_tx(SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
-
-
-  nrf_config_normal_tx(SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+                                 NULL, BURSTSIZE, NRF_SSI_BASE,
+                                 NRF_DMA_CH_RX, NRF_DMA_CH_TX,
+                                 NRF_CSN_BASE, NRF_CSN_PIN,
+                                 NRF_CE_BASE, NRF_CE_PIN,
+                                 NRF_IRQ_BASE, NRF_IRQ_PIN);
 }
 
 
@@ -1442,6 +1487,92 @@ usb_get_packet(uint8_t *packet_buf)
 }
 
 
+/*
+  Delay until specified amount of systicks have passed.
+
+  As systick is a 24-bit counter, the amount cannot exceed 0xffffff, or a bit
+  more than 16000000.
+*/
+static void
+delay_systicks(uint32_t cycles)
+{
+  uint32_t start = get_time();
+
+  while (calc_time(start) < cycles)
+    ;
+}
+
+
+static void
+delay_us(uint32_t us)
+{
+  /* This assumes that MCU_HZ is divisible by 1000000. */
+  uint32_t cycles = (MCU_HZ/1000000)*us;
+#if (MCU_HZ % 1000000)
+#error delay_us() computes delay incorrectly if MCU_HZ is not a multiple of 1000000
+#endif
+
+  while (cycles > 0xffffff)
+  {
+    delay_systicks(0xffffff);
+    cycles -= 0xffffff;
+  }
+  delay_systicks(cycles);
+}
+
+
+static void
+nrf_transmit_packet_nack(uint8_t *packet)
+{
+  nrf_tx_nack(packet, 32, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+}
+
+
+static void
+handle_cmd_debug(uint8_t *packet)
+{
+  /*
+    Hm. At some point I need to implement that I can send the DEBUG START
+    command to lm4f_pov.
+
+    And I need to wait for existing transfer to stop before doing more with
+    nRF24L01+. Not sure if I should disable interrupts, or if I should use
+    existing interrupt/dma routines.
+  */
+  uint8_t subcmd= packet[1];
+
+  /* First we need to wait for any on-going transmit to complete. */
+  while (transmit_running)
+    ;
+
+  if (subcmd == POV_SUBCMD_RESET_TO_BOOTLOADER)
+  {
+    /*
+      This debug command is sent to the application, not to the bootloader.
+      It requests the app to execute a software reset to get to the bootloader,
+      avoiding the need for manual press of the reset button.
+
+      Since we are using back-to-back transmission in the app for maximum
+      throughput, without automatic ack and re-transmit, we here send the
+      packet three times, to decrease the risk of it getting lost.
+    */
+    nrf_transmit_packet_nack(packet);
+    delay_us(40000);
+    nrf_transmit_packet_nack(packet);
+    delay_us(40000);
+    nrf_transmit_packet_nack(packet);
+    delay_us(40000);
+    /* Grab the next packet for the bootloader. */
+    usb_get_packet(packet);
+  }
+
+  nrf_config_bootload_tx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+
+
+  nrf_config_normal_tx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+}
+
+
 int main()
 {
   uint8_t status;
@@ -1468,7 +1599,7 @@ int main()
                            UART_CONFIG_PAR_NONE));
 
   config_ssi_gpio();
-  config_spi(SSI1_BASE);
+  config_spi(NRF_SSI_BASE);
   config_led();
 
   /*
@@ -1499,10 +1630,10 @@ int main()
   config_interrupts();
   config_udma_for_spi();
   nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_0DBM,
-                  SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+                  NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
   serial_output_str("Tx: Read CONFIG=0x");
   val = nrf_read_reg(nRF_CONFIG, &status,
-                     SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+                     NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
   serial_output_hexbyte(val);
   serial_output_str(" status=0x");
   serial_output_hexbyte(status);
@@ -1533,7 +1664,7 @@ int main()
 
     if (val == POV_CMD_DEBUG)
     {
-      handle_cmd_debug(val);
+      handle_cmd_debug(usb_packet);
       continue;
     }
 

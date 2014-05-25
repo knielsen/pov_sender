@@ -69,6 +69,7 @@
 #define POV_SUBCMD_ENTER_BOOTLOADER 254
 #define POV_SUBCMD_RESET_TO_APP 253
 #define POV_SUBCMD_FLASH_BUFFER 252
+#define POV_SUBCMD_EXIT_DEBUG   251
 #define POV_SUBCMD_STATUS_REPLY 240
 
 
@@ -150,9 +151,19 @@ memcpy(void *dest, const void *src, unsigned n)
 }
 
 
+static uint32_t
+my_strlen(const char *s)
+{
+  uint32_t len = 0;
+  while (*s++)
+    ++len;
+  return len;
+}
+
+
 __attribute__ ((unused))
 static void
-usb_data_put(unsigned char *buf, uint32_t size)
+usb_data_put(const unsigned char *buf, uint32_t size)
 {
   while (size > 0)
   {
@@ -164,6 +175,7 @@ usb_data_put(unsigned char *buf, uint32_t size)
     buf += actual;
   }
 }
+#define USB_DBG(x) usb_data_put((const unsigned char *)("!" x), sizeof(x))
 
 
 #define RECV_BUF_SIZE 8192
@@ -1247,7 +1259,7 @@ static void
 nrf_config_bootload_tx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 {
   nrf_write_reg(nRF_CONFIG, nRF_MASK_RX_DR |
-                  nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                  nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
                   ssi_base, csn_base, csn_pin);
   /* Enable auto-ack. */
   nrf_write_reg(nRF_EN_AA, nRF_ENAA_P0|nRF_ENAA_P1|nRF_ENAA_P2|
@@ -1275,7 +1287,7 @@ nrf_config_bootload_tx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 static void
 nrf_config_bootload_rx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 {
-  nrf_write_reg(nRF_CONFIG, nRF_PRIM_RX | nRF_MASK_RX_DR |
+  nrf_write_reg(nRF_CONFIG, nRF_PRIM_RX | nRF_MASK_TX_DS |
                   nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
                   ssi_base, csn_base, csn_pin);
   /* Enable auto-ack. */
@@ -1399,10 +1411,24 @@ get_time(void)
 
 
 static inline uint32_t
+calc_time_from_val(uint32_t start, uint32_t stop)
+{
+  return (start - stop) & 0xffffff;
+}
+
+
+static inline uint32_t
 calc_time(uint32_t start)
 {
   uint32_t stop = HWREG(NVIC_ST_CURRENT);
-  return (start - stop) & 0xffffff;
+  return calc_time_from_val(start, stop);
+}
+
+
+static inline uint32_t
+dec_time(uint32_t val, uint32_t inc)
+{
+  return (val - inc) & 0xffffff;
 }
 
 
@@ -1453,18 +1479,23 @@ transmit_start(void)
   Returns a true value if a reset was done, false if not.
 */
 static uint32_t
-usb_get_packet(uint8_t *packet_buf)
+usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
+               uint32_t *timeout_flag)
 {
   uint32_t reset = 0;
   uint32_t sofar = 0;
   uint32_t start_time;
   uint8_t val;
   uint32_t h, t;
+  uint32_t reset_count;
 
+  if (max_reset_count > 0)
+    *timeout_flag = 0;
   while (sofar < 32)
   {
     t = recvbuf.tail;
     start_time = get_time();
+    reset_count = 0;
     while ((h = recvbuf.head) == t)
     {
       /* Simple sync method: if data stream pauses, then reset state. */
@@ -1473,6 +1504,15 @@ usb_get_packet(uint8_t *packet_buf)
         sofar = 0;
         reset = 1;
         start_time = get_time();
+        if (max_reset_count > 0)
+        {
+          ++reset_count;
+          if (reset_count >= max_reset_count)
+          {
+            *timeout_flag = 1;
+            return reset;
+          }
+        }
       }
     }
     val = recvbuf.buf[t];
@@ -1521,6 +1561,22 @@ delay_us(uint32_t us)
 }
 
 
+/*
+  Read both the normal and FIFO status registers.
+  Returns normal status or'ed with (fifo status left-shifted 8).
+*/
+static uint32_t
+nrf_get_status(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t status;
+  uint32_t fifo_status;
+
+  fifo_status =
+    nrf_read_reg(nRF_FIFO_STATUS, &status, ssi_base, csn_base, csn_pin);
+  return (fifo_status << 8) | status;
+}
+
+
 static void
 nrf_transmit_packet_nack(uint8_t *packet)
 {
@@ -1528,22 +1584,81 @@ nrf_transmit_packet_nack(uint8_t *packet)
 }
 
 
+__attribute__ ((unused))
+static void
+str_put_hexdig(char *p, uint32_t v)
+{
+  *p = (v >= 10 ? v + ('a'-10) : v + '0');
+}
+
+
+__attribute__ ((unused))
+static void
+str_append_hex16(char *p, uint32_t v)
+{
+  while (*p)
+    ++p;
+  str_put_hexdig(p++, (v>>12) & 0xf);
+  str_put_hexdig(p++, (v>>8) & 0xf);
+  str_put_hexdig(p++, (v>>4) & 0xf);
+  str_put_hexdig(p++, v & 0xf);
+  *p = '\0';
+}
+
+
+/*
+  Transmit a packet with auto-ack and retry.
+  Wait for it to be successfully transmitted, or for a retry timeout.
+  Return NULL for ok or else an error message.
+*/
+static const char *
+nrf_transmit_packet(uint8_t *packet)
+{
+  uint32_t start_time = get_time();
+  const char *errmsg;
+
+  nrf_tx(packet, 32, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+  ce_high(NRF_CE_BASE, NRF_CE_PIN);
+  delay_us(10);
+  ce_low(NRF_CE_BASE, NRF_CE_PIN);
+
+  for (;;)
+  {
+    uint32_t status = nrf_get_status(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+    if (status & nRF_MAX_RT)
+    {
+      errmsg = "E: No ack from receiver\r\n";
+      break;
+    }
+    if (status & nRF_TX_DS)
+    {
+      errmsg = NULL;
+      break;
+    }
+    if (calc_time(start_time) > MCU_HZ/5)
+    {
+      errmsg = "E: Timeout from nRF24L01+ waiting for transmit\r\n";
+      break;
+    }
+  }
+  /* Clear the data sent / max retries flags. */
+  nrf_write_reg(nRF_STATUS, nRF_TX_DS|nRF_MAX_RT,
+                NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+  return errmsg;
+}
+
+
 static void
 handle_cmd_debug(uint8_t *packet)
 {
-  /*
-    Hm. At some point I need to implement that I can send the DEBUG START
-    command to lm4f_pov.
-
-    And I need to wait for existing transfer to stop before doing more with
-    nRF24L01+. Not sure if I should disable interrupts, or if I should use
-    existing interrupt/dma routines.
-  */
   uint8_t subcmd= packet[1];
+  uint32_t usb_timeout = 0;
+  static const uint32_t usb_timeout_seconds = 5;
 
   /* First we need to wait for any on-going transmit to complete. */
   while (transmit_running)
     ;
+  delay_us(40000);
 
   if (subcmd == POV_SUBCMD_RESET_TO_BOOTLOADER)
   {
@@ -1563,11 +1678,84 @@ handle_cmd_debug(uint8_t *packet)
     nrf_transmit_packet_nack(packet);
     delay_us(40000);
     /* Grab the next packet for the bootloader. */
-    usb_get_packet(packet);
+    usb_get_packet(packet, usb_timeout_seconds*5, &usb_timeout);
   }
 
   nrf_config_bootload_tx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
 
+  while (!usb_timeout)
+  {
+    const char *errmsg;
+    uint8_t subcmd = packet[1];
+
+    /*
+      Normally, we should exit after we have seen POV_SUBCMD_EXIT_DEBUG.
+      But if we happen to get interrupted in the middle of something,
+      exit if we see any non-debug command (for now, unfortunately that
+      command will be lost).
+    */
+    if (packet[0] != POV_CMD_DEBUG || subcmd == POV_SUBCMD_EXIT_DEBUG)
+      break;
+
+    errmsg = nrf_transmit_packet(packet);
+
+    if (!errmsg &&
+        (subcmd == POV_SUBCMD_FLASH_BUFFER ||
+         subcmd == POV_SUBCMD_ENTER_BOOTLOADER))
+    {
+      /* Get the status reply from the bootloader. */
+      uint32_t start_time, wait_counter;
+
+      nrf_config_bootload_rx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+      ce_high(NRF_CE_BASE, NRF_CE_PIN);
+
+      start_time = get_time();
+      wait_counter = 6;  /* 0.6 seconds */
+      while (wait_counter > 0)
+      {
+        uint32_t now_time;
+        uint32_t status = nrf_get_status(NRF_SSI_BASE,
+                                         NRF_CSN_BASE, NRF_CSN_PIN);
+        if (status & nRF_RX_DR)
+          break;                                    /* Data ready. */
+        now_time = get_time();
+        if (calc_time_from_val(start_time, now_time) > MCU_HZ/10)
+        {
+          --wait_counter;
+          start_time = dec_time(start_time, MCU_HZ/10);
+        }
+      }
+      ce_low(NRF_CE_BASE, NRF_CE_PIN);
+
+      if (!wait_counter)
+        errmsg = "E: Timeout waiting for reply from bootloader\r\n";
+      else
+      {
+        nrf_rx(packet, 32, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+        if (packet[0] != POV_CMD_DEBUG || packet[1] != POV_SUBCMD_STATUS_REPLY)
+          errmsg = "E: Unexpected reply packet from bootloader\r\n";
+        else if (packet[2])
+          errmsg = "E: Error status reply from bootloader\r\n";
+      }
+      nrf_config_bootload_tx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+    }
+
+    if (errmsg)
+      usb_data_put((const unsigned char *)errmsg, my_strlen(errmsg));
+    else
+      usb_data_put((const unsigned char *)"OK\r\n", 4);
+
+    /* Get the next command over USB from the programmer. */
+    usb_get_packet(packet, usb_timeout_seconds*5, &usb_timeout);
+  }
+  if (usb_timeout)
+  {
+    static const char inactivity_error[] =
+      "E: No activity on USB, leaving debug mode\r\n";
+    usb_data_put((const unsigned char *)&inactivity_error[0],
+                 sizeof(inactivity_error)-1);
+    delay_us(200000);
+  }
 
   nrf_config_normal_tx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
 }
@@ -1652,7 +1840,7 @@ int main()
     uint8_t usb_packet[32];
 
     /* Wait for a packet on the USB. */
-    if (usb_get_packet(usb_packet))
+    if (usb_get_packet(usb_packet, 0, NULL))
     {
       /*
         If we had a resync on the USB, then reset the frame packet count.

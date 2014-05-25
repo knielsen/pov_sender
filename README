@@ -32,6 +32,8 @@ for debug packet:
                 wait for the reply. The third byte of this packet is either
                 zero for ok or else an error code.
 
+  U = 251       Exit debug mode, going back to streaming frames to POV.
+
   U = 252       Flash. This instructs the bootloader to write the contents of
                 the 1024-byte flash buffer to flash. The destination is
                 identified with a block number stored in the following 4
@@ -39,8 +41,8 @@ for debug packet:
                 1024*blocknum. The bootloader sends a U=240 status reply when
                 done.
 
-  U = 253       Reset; the bootloader sends a U=240 status reply and transfers
-                control to the target application.
+  U = 253       Reset; the bootloader transfers control to the target
+                application.
 
   U = 254       Enter bootloader. If the bootloader receives this within 1
                 second of reset, it replies with a T=254,U=240 packet and

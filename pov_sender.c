@@ -1580,7 +1580,24 @@ nrf_get_status(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 static void
 nrf_transmit_packet_nack(uint8_t *packet)
 {
+  uint32_t start_time = get_time();
+
   nrf_tx_nack(packet, 32, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+  ce_high(NRF_CE_BASE, NRF_CE_PIN);
+  delay_us(10);
+  ce_low(NRF_CE_BASE, NRF_CE_PIN);
+
+  for (;;)
+  {
+    uint32_t status = nrf_get_status(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+    if (status & (nRF_TX_DS|nRF_MAX_RT))
+      break;
+    if (calc_time(start_time) > MCU_HZ/20)
+      break;
+  }
+  /* Clear the data sent / max retries flags. */
+  nrf_write_reg(nRF_STATUS, nRF_TX_DS|nRF_MAX_RT,
+                NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
 }
 
 

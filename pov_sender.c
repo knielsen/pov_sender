@@ -1011,6 +1011,19 @@ nrf_async_transmit_multi_start(struct nrf_async_transmit_multi *a,
 
 
 /*
+  This is called to continue after a 4 microseconds delay needed from taking
+  CE high to starting SPI operations.
+*/
+static void
+nrf_async_pece_delay_cb(void *data)
+{
+  struct nrf_async_transmit_multi *a = data;
+  nrf_async_transmit_multi_cont(a, 0);
+}
+
+static void timer2a_set_delay(uint32_t cycles, void (*cb)(void *), void *cb_data);
+
+/*
   Called to continue a multi-packet back-to-back write session.
   This should be called when an event occurs, either in the form of
   an SSI interrupt or in the form of a GPIO interrupt on the nRF24L01+
@@ -1077,6 +1090,12 @@ resched:
     {
       ce_high(a->ce_base, a->ce_pin);
       a->ce_asserted = 1;
+      /*
+        nRF24L01+ datasheet says that there must be at least 4 microseconds
+        from a positive edge on CE to CSN being taken low.
+      */
+      timer2a_set_delay(MCU_HZ*4/1000000, nrf_async_pece_delay_cb, a);
+      return 0;
     }
     /*
       Now clear the TX_DS flag, and at the same time get the STATUS register
@@ -1321,6 +1340,40 @@ static struct nrf_async_transmit_multi transmit_multi_state;
 static volatile uint8_t transmit_multi_running = 0;
 static volatile uint8_t transmit_running = 0;
 
+
+static void (* volatile timer2a_cb)(void *);
+static void * volatile timer2a_cb_data;
+
+/* Request a callback to be called after a certain number of cycles passed. */
+static void
+timer2a_set_delay(uint32_t cycles, void (*cb)(void *), void *cb_data)
+{
+  timer2a_cb = cb;
+  timer2a_cb_data = cb_data;
+  ROM_TimerLoadSet(TIMER2_BASE, TIMER_A, cycles);
+  ROM_TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+  ROM_TimerEnable(TIMER2_BASE, TIMER_A);
+}
+
+
+void
+IntHandlerTimer2A(void)
+{
+  void (*cb)(void *) = timer2a_cb;
+
+  ROM_TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+  ROM_TimerDisable(TIMER2_BASE, TIMER_A);
+  ROM_TimerIntDisable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+  if (cb)
+  {
+    (*cb)(timer2a_cb_data);
+    timer2a_cb = NULL;
+  }
+}
+
+
+static void start_next_burst(void *);
+
 static void
 handle_end_of_transmit_burst(void)
 {
@@ -1333,9 +1386,7 @@ handle_end_of_transmit_burst(void)
       for more than 4 milliseconds (which is just a bit more than the time
       to send 24 full packets back-to-back).
     */
-    ROM_TimerLoadSet(TIMER2_BASE, TIMER_A, 20*MCU_HZ/1000000);
-    ROM_TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
-    ROM_TimerEnable(TIMER2_BASE, TIMER_A);
+    timer2a_set_delay(MCU_HZ/1000000*20, start_next_burst, NULL);
   }
   else
     transmit_running = 0;
@@ -1432,14 +1483,9 @@ dec_time(uint32_t val, uint32_t inc)
 }
 
 
-void
-IntHandlerTimer2A(void)
+/* Start the next write burst (unless we are done). */
+static void start_next_burst(void *dummy)
 {
-  ROM_TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
-  ROM_TimerDisable(TIMER2_BASE, TIMER_A);
-  ROM_TimerIntDisable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
-
-  /* Start the next write burst (unless we are done). */
   if (write_sofar < BUF_SIZE_PAD)
   {
     transmit_multi_running = 1;
@@ -1725,6 +1771,11 @@ handle_cmd_debug(uint8_t *packet)
 
       nrf_config_bootload_rx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
       ce_high(NRF_CE_BASE, NRF_CE_PIN);
+      /*
+        nRF24L01+ datasheet says that there must be at least 4 microseconds
+        from a positive edge on CE to CSN being taken low.
+      */
+      delay_us(4);
 
       start_time = get_time();
       wait_counter = 6;  /* 0.6 seconds */

@@ -63,6 +63,9 @@
 
 
 /* Communications protocol. */
+#define POV_CMD_CONFIG 255
+#define POV_SUBCMD_SET_CONFIG 1
+
 #define POV_CMD_DEBUG 254
 #define POV_SUBCMD_RESET_TO_BOOTLOADER 255
 #define POV_SUBCMD_ENTER_BOOTLOADER 254
@@ -1828,6 +1831,27 @@ handle_cmd_debug(uint8_t *packet)
 }
 
 
+static void
+handle_cmd_config(uint8_t *packet)
+{
+  /* First we need to wait for any on-going transmit to complete. */
+  while (transmit_running)
+    ;
+  delay_us(40000);
+
+  /*
+    As we are transmitting without acks from the receiver, transmit the
+    command 3 times to maximise the changes that it will be received.
+  */
+  nrf_transmit_packet_nack(packet);
+  delay_us(40000);
+  nrf_transmit_packet_nack(packet);
+  delay_us(40000);
+  nrf_transmit_packet_nack(packet);
+  delay_us(40000);
+}
+
+
 int main()
 {
   uint8_t status;
@@ -1920,6 +1944,11 @@ int main()
     if (val == POV_CMD_DEBUG)
     {
       handle_cmd_debug(usb_packet);
+      continue;
+    }
+    else if (val == POV_CMD_CONFIG)
+    {
+      handle_cmd_config(usb_packet);
       continue;
     }
 

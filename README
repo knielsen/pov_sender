@@ -16,7 +16,9 @@ The first byte T identifies the kind of packet.
 
 If the value is 0 <= T <= 204, then the packet contains frame buffer data. The remaning 31 bytes are data to be loaded into the frame buffer, at offset (T*31).
 
-If the value is T=255, then it is a command packet. Format of this to be determined.
+If the value is T=255, then it is a command packet. The second byte U is a
+subcmd, for now only U=1, config command, is defined. The third byte is the DC
+value to set, and the fourth byte is the mode (rect or tri framebuf).
 
 If the value is T=254, then it is a debug packet. This is used to program the
 flash on the POV control board, over wireless. The second byte U is a sub-type

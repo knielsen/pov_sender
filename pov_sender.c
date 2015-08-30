@@ -1780,7 +1780,13 @@ handle_cmd_debug(uint8_t *packet)
       delay_us(4);
 
       start_time = get_time();
-      wait_counter = 6;  /* 0.6 seconds */
+      /*
+        For STM32F4, we have big sectors (up to 128MB). According to the data
+        sheet, they can take up to 4s to erase maximum, plus another up to
+        100us maximum per word to write. So the worst case latency is actually
+        up to around 8 seconds, though the common case should be much faster.
+      */
+      wait_counter = 80;  /* 8.0 seconds */
       while (wait_counter > 0)
       {
         uint32_t now_time;

@@ -426,7 +426,7 @@ config_usb(void)
 
   USBBufferInit((tUSBBuffer *)&g_sTxBuffer);
   USBBufferInit((tUSBBuffer *)&g_sRxBuffer);
-  USBStackModeSet(0, USB_MODE_DEVICE, 0);
+  USBStackModeSet(0, USB_MODE_FORCE_DEVICE, 0);
   USBDCDCInit(0, (tUSBDCDCDevice *)&g_sCDCDevice);
 }
 

@@ -1,5 +1,6 @@
 #include <inttypes.h>
 #include <string.h>
+#include <math.h>
 
 #include "inc/hw_gpio.h"
 #include "inc/hw_memmap.h"
@@ -38,6 +39,15 @@
     PF1  MOSI       PF0 .7 8. PB0
     PB0  IRQ
     PB3  CE
+
+  L6234 motor controller pinout:
+
+    IN1   PG0   (timer t4ccp0)
+    IN2   PG1   (timer t4ccp1)
+    IN3   PG2   (timer t5ccp0)
+    EN1   PG3
+    EN2   PG4
+    EN3   PG5
 */
 
 #define SIZEX 65
@@ -77,6 +87,18 @@
 
 /* To change this, must fix clock setup in the code. */
 #define MCU_HZ 80000000
+
+
+/* PWM parameters for driving the brushless motor. */
+#define PWM_FREQ 50000
+#define PWM_PERIOD (MCU_HZ/PWM_FREQ)
+/* L6234 adds 300 ns of deadtime. */
+#define DEADTIME (MCU_HZ/1000*300/1000000)
+
+
+static const float F_PI = 3.141592654f;
+
+static void motor_update(void);
 
 
 static void
@@ -1337,6 +1359,8 @@ config_interrupts(void)
 }
 
 
+/* nRF24L01+ communications. */
+
 static uint32_t write_sofar;
 static struct nrf_async_transmit_multi transmit_multi_state;
 static volatile uint8_t transmit_multi_running = 0;
@@ -1515,6 +1539,247 @@ transmit_start(void)
                                  NRF_CSN_BASE, NRF_CSN_PIN,
                                  NRF_CE_BASE, NRF_CE_PIN,
                                  NRF_IRQ_BASE, NRF_IRQ_PIN);
+}
+
+
+/* Motor controller. */
+
+static volatile uint32_t pwm1_match_value;
+static volatile uint32_t pwm2_match_value;
+static volatile uint32_t pwm3_match_value;
+
+static void
+setup_timer_pwm(void)
+{
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER4);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER5);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOG);
+  ROM_GPIOPinConfigure(GPIO_PG0_T4CCP0);
+  ROM_GPIOPinConfigure(GPIO_PG1_T4CCP1);
+  ROM_GPIOPinConfigure(GPIO_PG2_T5CCP0);
+  ROM_GPIOPinTypeTimer(GPIO_PORTG_BASE, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2);
+  //ROM_GPIOPadConfigSet(GPIO_PORTG_BASE, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2,
+  //                     GPIO_STRENGTH_8MA, GPIO_PIN_TYPE_STD);
+  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTG_BASE, GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5);
+  /* Set EN pins low, for off. */
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_3, 0);
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_4, 0);
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_5, 0);
+
+  ROM_TimerConfigure(TIMER4_BASE,
+                     TIMER_CFG_SPLIT_PAIR|TIMER_CFG_A_PWM|TIMER_CFG_B_PWM);
+  ROM_TimerConfigure(TIMER5_BASE,
+                     TIMER_CFG_SPLIT_PAIR|TIMER_CFG_A_PWM|TIMER_CFG_B_ONE_SHOT);
+
+  ROM_TimerLoadSet(TIMER4_BASE, TIMER_BOTH, PWM_PERIOD);
+  ROM_TimerLoadSet(TIMER5_BASE, TIMER_A, PWM_PERIOD);
+  pwm1_match_value = pwm2_match_value = pwm3_match_value = PWM_PERIOD-1;
+  ROM_TimerMatchSet(TIMER4_BASE, TIMER_A, pwm1_match_value);
+  ROM_TimerMatchSet(TIMER4_BASE, TIMER_B, pwm2_match_value);
+  ROM_TimerMatchSet(TIMER5_BASE, TIMER_A, pwm3_match_value);
+  /*
+    Set the MRSU bit in config register, so that we can change the PWM duty
+    cycle on-the-fly, and the new value will take effect at the start of the
+    next period.
+  */
+  HWREG(TIMER4_BASE + TIMER_O_TAMR) |= TIMER_TAMR_TAMRSU;
+  HWREG(TIMER4_BASE + TIMER_O_TBMR) |= TIMER_TBMR_TBMRSU;
+  HWREG(TIMER5_BASE + TIMER_O_TAMR) |= TIMER_TAMR_TAMRSU;
+
+  ROM_TimerControlEvent(TIMER4_BASE, TIMER_BOTH, TIMER_EVENT_POS_EDGE);
+  ROM_TimerControlEvent(TIMER5_BASE, TIMER_A, TIMER_EVENT_POS_EDGE);
+  ROM_TimerIntEnable(TIMER4_BASE, TIMER_CAPA_EVENT|TIMER_CAPB_EVENT);
+  ROM_TimerIntEnable(TIMER5_BASE, TIMER_CAPA_EVENT);
+}
+
+
+static void
+l6234_enable(void)
+{
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_3, GPIO_PIN_3);
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_4, GPIO_PIN_4);
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_5, GPIO_PIN_5);
+}
+
+
+static void
+l6234_disable(void)
+{
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_3, 0);
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_4, 0);
+  ROM_GPIOPinWrite(GPIO_PORTG_BASE, GPIO_PIN_5, 0);
+}
+
+
+#define DAMPER_FACTOR (0.5f*(float)(PWM_PERIOD-2*DEADTIME))
+static float damper = 0.5f*DAMPER_FACTOR;
+
+static void
+set_pwm(float duty1, float duty2, float duty3)
+{
+  /*
+    The L6234 inserts 300 ns of deadtime to protect against both MOSFETs being
+    open at the same time. Adjust the PWM match value accordingly, so that we
+    get correct ratios between duty cycles also for small duty cycle values
+    (which may be needed to limit the current used in beefy motors).
+  */
+  pwm1_match_value = (PWM_PERIOD-DEADTIME) - (uint32_t)(duty1 * damper);
+  pwm2_match_value = (PWM_PERIOD-DEADTIME) - (uint32_t)(duty2 * damper);
+  pwm3_match_value = (PWM_PERIOD-DEADTIME) - (uint32_t)(duty3 * damper);
+}
+
+
+static void
+set_motor(float angle)
+{
+  float s1, s2, s3;
+  s1 = sinf(angle);
+  s2 = sinf(angle + (2.0f*F_PI/3.0f));
+  s3 = sinf(angle + (2.0f*F_PI*2.0f/3.0f));
+  set_pwm(1.0f + s1, 1.0f + s2, 1.0f + s3);
+}
+
+
+void
+IntHandlerTimer4A(void)
+{
+  /* Clear the interrupt. */
+  HWREG(TIMER4_BASE + TIMER_O_ICR) = TIMER_CAPA_EVENT;
+  /* Set the duty cycle for the following PWM period. */
+  HWREG(TIMER4_BASE + TIMER_O_TAMATCHR) = pwm1_match_value;
+}
+
+
+void
+IntHandlerTimer4B(void)
+{
+  /* Clear the interrupt. */
+  HWREG(TIMER4_BASE + TIMER_O_ICR) = TIMER_CAPB_EVENT;
+  /* Set the duty cycle for the following PWM period. */
+  HWREG(TIMER4_BASE + TIMER_O_TBMATCHR) = pwm2_match_value;
+}
+
+
+void
+IntHandlerTimer5A(void)
+{
+  /* Clear the interrupt. */
+  HWREG(TIMER5_BASE + TIMER_O_ICR) = TIMER_CAPA_EVENT;
+  /* Set the duty cycle for the following PWM period. */
+  HWREG(TIMER5_BASE + TIMER_O_TAMATCHR) = pwm3_match_value;
+
+  motor_update();
+}
+
+
+/*
+  The current electrical angle.
+  One turn corresponds to a value of 2**32.
+*/
+static volatile uint32_t cur_angle = 0;
+/* The current speed, added to cur_angle every 1/PWM_FREQ. */
+static volatile uint32_t angle_inc = 0;
+/* Counter, counting at PWM_FREQ. */
+static volatile uint32_t cur_pwm_tick = 0;
+/*
+  Speed control.
+
+  When speed_changing is true, the interrupt routine starts changing the
+  speed to a value of change_speed_to, over a duration of
+  speed_change_duration ticks (at PWM_FREQ Hz). The speed is the value
+  of angle_inc.
+*/
+static volatile struct speed_change_struct {
+  uint8_t speed_changing;
+  uint32_t speed_change_to;
+  uint32_t speed_change_duration;
+  /* Internal state for speed change. */
+  uint32_t speed_change_from;
+  uint32_t speed_change_start;
+  float speed_change_factor;
+} spdctl;
+
+static void
+motor_update(void)
+{
+  uint32_t l_angle;
+  uint32_t l_tick;
+  float f_angle;
+
+  /* Set the PWM for the current electrical angle. */
+  l_angle = cur_angle;
+  f_angle = (float)l_angle * (2.0f*F_PI/4294967296.0f);
+  set_motor(f_angle);
+
+  /* Increment the electrical angle at the current speed. */
+  cur_angle = l_angle + angle_inc;
+
+  l_tick = cur_pwm_tick;
+  if (spdctl.speed_changing)
+  {
+    /* Do the next step of speed change. */
+    uint32_t sofar = l_tick - spdctl.speed_change_start;
+    /* Check if speed change is complete. */
+    if (sofar > spdctl.speed_change_duration)
+    {
+      angle_inc = spdctl.speed_change_to;
+      spdctl.speed_changing = 0;
+    }
+    else
+      angle_inc = spdctl.speed_change_from +
+        (uint32_t)(spdctl.speed_change_factor * (float)sofar);
+  }
+  cur_pwm_tick = l_tick + 1;
+}
+
+
+static void
+set_motor_target_speed(float rps, float rampup_time, float power)
+{
+  static const float mechanic_to_electric_rps = 4.0f;
+  float electric_rps;
+  uint32_t l_inc, l_dur;
+
+  damper = power * DAMPER_FACTOR;
+  electric_rps = mechanic_to_electric_rps * rps;
+  spdctl.speed_change_to = electric_rps*((float)0x100000000/(float)PWM_FREQ);
+  l_dur = (uint32_t)(rampup_time * PWM_FREQ);
+  spdctl.speed_change_duration = l_dur;;
+
+  l_inc = angle_inc;
+  spdctl.speed_change_from = l_inc;
+  spdctl.speed_change_factor =
+    (float)(int32_t)(spdctl.speed_change_to - l_inc)/(float)l_dur;
+  spdctl.speed_change_start = cur_pwm_tick;
+  spdctl.speed_changing = 1;
+
+  ROM_IntEnable(INT_TIMER4A);
+  ROM_IntEnable(INT_TIMER4B);
+  ROM_IntEnable(INT_TIMER5A);
+  ROM_TimerEnable(TIMER4_BASE, TIMER_BOTH);
+  ROM_TimerEnable(TIMER5_BASE, TIMER_A);
+
+  /*
+    Synchronise the timers.
+
+    We can not use wait-for-trigger, as there is an errata GPTM#04 that
+    wait-for-trigger is not available for PWM mode.
+
+    So we need to use the SYNC register.
+    There is also an errata for SYNC:
+
+      "GPTM#01 GPTMSYNC Bits Require Manual Clearing"
+
+    Since the sync register for all timers is in timer 0, that timer must be
+    enabled.
+  */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+  HWREG(TIMER0_BASE+TIMER_O_SYNC) |=
+    (uint32_t)(TIMER_4A_SYNC|TIMER_4B_SYNC|TIMER_5A_SYNC);
+  HWREG(TIMER0_BASE+TIMER_O_SYNC) &=
+    ~(uint32_t)(TIMER_4A_SYNC|TIMER_4B_SYNC|TIMER_5A_SYNC);
+
+  l6234_enable();
 }
 
 
@@ -1866,6 +2131,7 @@ int main()
   uint8_t next_run_num;
   uint32_t read_idx;
   uint32_t corruption_flag;
+  float rampup_seconds, mechanical_rps, power_factor;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
@@ -1897,10 +2163,17 @@ int main()
                      TIMER_CFG_A_ONE_SHOT | TIMER_CFG_B_ONE_SHOT);
 
   ROM_IntPriorityGroupingSet(7);
-  ROM_IntPrioritySet(INT_SSI1, 0 << 5);
-  ROM_IntPrioritySet(INT_GPIOB, 1 << 5);
-  ROM_IntPrioritySet(INT_TIMER2A, 2 << 5);
-  ROM_IntPrioritySet(INT_USB0, 4 << 5);
+  ROM_IntPrioritySet(INT_SSI1, 1 << 5);
+  ROM_IntPrioritySet(INT_GPIOB, 2 << 5);
+  ROM_IntPrioritySet(INT_TIMER2A, 3 << 5);
+  ROM_IntPrioritySet(INT_USB0, 5 << 5);
+  /*
+    We want the motor controller to run at the highest priority, so we do not
+    get any glitches in the motion.
+  */
+  ROM_IntPrioritySet(INT_TIMER4A, 0 << 5);
+  ROM_IntPrioritySet(INT_TIMER4B, 0 << 5);
+  ROM_IntPrioritySet(INT_TIMER5A, 0 << 5);
 
   config_usb();
 
@@ -1924,6 +2197,29 @@ int main()
   serial_output_hexbyte(status);
   serial_output_str("\r\n");
   serial_output_str("Done!\r\n");
+
+  /* Small delay to allow USB to get up before starting motor. */
+  ROM_SysCtlDelay(MCU_HZ/3);
+
+  serial_output_str("Setting up motor controller...\r\n");
+  setup_timer_pwm();
+  l6234_disable();
+  serial_output_str("Motor controller init done\r\n");
+
+  /*
+    Start the motor slowly, then ramp up speed.
+    That's a primitive way to start up without actually measuring the
+    position of the motor phases with feedback or hall sensors.
+
+    power_factor=0.5 is in fact enough to drive the motor at 25 RPS.
+    However, let's give it a bit more power, just to help it keep the
+    speed stable. Not sure if it makes much of a difference, but damper=0.7
+    is low enough that the motorcontroller chip does not get very hot.
+  */
+  rampup_seconds = 8.0f;
+  mechanical_rps = 25.0f;
+  power_factor = 0.5f;
+  set_motor_target_speed(mechanical_rps, rampup_seconds, power_factor);
 
   sofar = 0;
   next_run_num = 0;

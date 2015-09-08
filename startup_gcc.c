@@ -39,6 +39,9 @@ extern void IntHandlerGPIOb(void);
 extern void IntHandlerSSI1(void);
 extern void IntHandlerTimer2A(void);
 extern void USB0DeviceIntHandler(void);
+extern void IntHandlerTimer4A(void);
+extern void IntHandlerTimer4B(void);
+extern void IntHandlerTimer5A(void);
 
 //*****************************************************************************
 //
@@ -150,8 +153,8 @@ void (* const g_pfnVectors[])(void) =
     0,                                      // Reserved
     IntDefaultHandler,                      // I2C2 Master and Slave
     IntDefaultHandler,                      // I2C3 Master and Slave
-    IntDefaultHandler,                      // Timer 4 subtimer A
-    IntDefaultHandler,                      // Timer 4 subtimer B
+    IntHandlerTimer4A,                      // Timer 4 subtimer A
+    IntHandlerTimer4B,                      // Timer 4 subtimer B
     0,                                      // Reserved
     0,                                      // Reserved
     0,                                      // Reserved
@@ -172,7 +175,7 @@ void (* const g_pfnVectors[])(void) =
     0,                                      // Reserved
     0,                                      // Reserved
     0,                                      // Reserved
-    IntDefaultHandler,                      // Timer 5 subtimer A
+    IntHandlerTimer5A,                      // Timer 5 subtimer A
     IntDefaultHandler,                      // Timer 5 subtimer B
     IntDefaultHandler,                      // Wide Timer 0 subtimer A
     IntDefaultHandler,                      // Wide Timer 0 subtimer B

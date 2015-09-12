@@ -48,6 +48,38 @@
     EN1   PG3
     EN2   PG4
     EN3   PG5
+
+  Switches and buttons pintout:
+
+  Connector P1:
+    PA2   Push button 1
+    PA3   Push button 2
+    PA4   Push button 3
+    PA5   Push button 4
+    PA6   Push button 5
+    PC4   Switch 1
+    PC5   Switch 2
+    PC6   Switch 3
+
+  Connector P2:
+    PB4   Push button 1
+    PE2   Push button 2
+    PB6   Push button 3
+    PB7   Push button 4
+    PC7   Push button 5
+    PF4   Switch 1
+    PD7   Switch 2
+    PE3   Switch 3
+
+  Connector P3:
+    PD0   Push button 1
+    PE4   Push button 2
+    PD2   Push button 3
+    PD3   Push button 4
+    PD1   Push button 5
+    PB5   Switch 1
+    PD6   Switch 2
+    PE5   Switch 3
 */
 
 #define SIZEX 65
@@ -201,6 +233,60 @@ usb_data_put(const unsigned char *buf, uint32_t size)
 }
 #define USB_DBG(x) usb_data_put((const unsigned char *)("!" x), sizeof(x))
 
+
+/* GPIO for a couple buttons/switches to control things. */
+
+static void
+config_buttons_gpio(void)
+{
+  /* Setup for connector P1. */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
+  ROM_GPIODirModeSet(GPIO_PORTA_BASE, GPIO_PIN_2|GPIO_PIN_3| GPIO_PIN_4|
+                     GPIO_PIN_5|GPIO_PIN_6, GPIO_DIR_MODE_IN);
+  ROM_GPIODirModeSet(GPIO_PORTC_BASE, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6,
+                     GPIO_DIR_MODE_IN);
+  ROM_GPIOPadConfigSet(GPIO_PORTA_BASE, GPIO_PIN_2|GPIO_PIN_3|
+                       GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6,
+                       GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+  ROM_GPIOPadConfigSet(GPIO_PORTC_BASE, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6,
+                       GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+
+  /* Let's setup for connectors P2 and P3 also. */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOE);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+  /* PD7 is special (NMI), needs unlock to be re-assigned to timer. */
+  HWREG(GPIO_PORTD_BASE + GPIO_O_LOCK) = GPIO_LOCK_KEY_DD;
+  HWREG(GPIO_PORTD_BASE + GPIO_O_CR) |= 0x80;
+  HWREG(GPIO_PORTD_BASE + GPIO_O_LOCK) = 0;
+
+  ROM_GPIODirModeSet(GPIO_PORTB_BASE, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|
+                     GPIO_PIN_7, GPIO_DIR_MODE_IN);
+  ROM_GPIODirModeSet(GPIO_PORTC_BASE, GPIO_PIN_7, GPIO_DIR_MODE_IN);
+  ROM_GPIODirModeSet(GPIO_PORTD_BASE, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|
+                     GPIO_PIN_3|GPIO_PIN_6|GPIO_PIN_7, GPIO_DIR_MODE_IN);
+  ROM_GPIODirModeSet(GPIO_PORTE_BASE, GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|
+                     GPIO_PIN_5, GPIO_DIR_MODE_IN);
+  ROM_GPIODirModeSet(GPIO_PORTF_BASE, GPIO_PIN_4, GPIO_DIR_MODE_IN);
+  ROM_GPIOPadConfigSet(GPIO_PORTB_BASE, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|
+                       GPIO_PIN_7, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+  ROM_GPIOPadConfigSet(GPIO_PORTC_BASE, GPIO_PIN_7,
+                       GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+  ROM_GPIOPadConfigSet(GPIO_PORTD_BASE, GPIO_PIN_0|GPIO_PIN_1|
+                       GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_6|GPIO_PIN_7,
+                       GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+  ROM_GPIOPadConfigSet(GPIO_PORTE_BASE, GPIO_PIN_2|GPIO_PIN_3|
+                       GPIO_PIN_4|GPIO_PIN_5,
+                       GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+  ROM_GPIOPadConfigSet(GPIO_PORTF_BASE, GPIO_PIN_4,
+                       GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+}
+
+
+/* USB stuff. */
 
 #define RECV_BUF_SIZE 8192
 static volatile
@@ -1681,6 +1767,9 @@ static volatile uint32_t cur_angle = 0;
 static volatile uint32_t angle_inc = 0;
 /* Counter, counting at PWM_FREQ. */
 static volatile uint32_t cur_pwm_tick = 0;
+/* Flag to remember if motor is stopped or running. */
+static uint8_t motor_running = 0;
+
 /*
   Speed control.
 
@@ -1783,6 +1872,67 @@ set_motor_target_speed(float rps, float rampup_time, float power)
 }
 
 
+static void
+stop_motor(void)
+{
+  l6234_disable();
+  ROM_TimerDisable(TIMER4_BASE, TIMER_BOTH);
+  ROM_TimerDisable(TIMER5_BASE, TIMER_A);
+  ROM_IntDisable(INT_TIMER4A);
+  ROM_IntDisable(INT_TIMER4B);
+  ROM_IntDisable(INT_TIMER5A);
+  spdctl.speed_changing = 0;
+  damper = 0.0f;
+  angle_inc = 0;
+  cur_angle = 0;
+  cur_pwm_tick = 0;
+  motor_running = 0;
+}
+
+
+static void
+start_motor(void)
+{
+  float rampup_seconds, mechanical_rps, power_factor;
+
+  /*
+    Start the motor slowly, then ramp up speed.
+    That's a primitive way to start up without actually measuring the
+    position of the motor phases with feedback or hall sensors.
+
+    power_factor=0.5 is in fact enough to drive the motor at 25 RPS.
+    However, let's give it a bit more power, just to help it keep the
+    speed stable. Not sure if it makes much of a difference, but damper=0.7
+    is low enough that the motorcontroller chip does not get very hot.
+  */
+  rampup_seconds = 8.0f;
+  mechanical_rps = 25.0f;
+  power_factor = 0.5f;
+  motor_running = 1;
+  set_motor_target_speed(mechanical_rps, rampup_seconds, power_factor);
+}
+
+
+static void
+check_buttons(void)
+{
+  long buttons = ROM_GPIOPinRead(GPIO_PORTA_BASE, GPIO_PIN_2|GPIO_PIN_3|
+                                 GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6);
+  long switches = ROM_GPIOPinRead(GPIO_PORTC_BASE,
+                                  GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6);
+  uint32_t status = ((buttons >> 2) & 0x1f) | ((switches << 1) & 0xe0);
+
+  /* ToDo: Some anti-prell handling here! */
+  if (status & (1<<7))
+  {
+    if (motor_running)
+      stop_motor();
+    else if (!motor_running)
+      start_motor();
+  }
+}
+
+
 /*
   Read a packet from USB. A packet is 32 bytes of data.
 
@@ -1827,6 +1977,8 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
           }
         }
       }
+
+      check_buttons();
     }
     val = recvbuf.buf[t];
     ++t;
@@ -2131,7 +2283,6 @@ int main()
   uint8_t next_run_num;
   uint32_t read_idx;
   uint32_t corruption_flag;
-  float rampup_seconds, mechanical_rps, power_factor;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
@@ -2152,6 +2303,35 @@ int main()
   config_ssi_gpio();
   config_spi(NRF_SSI_BASE);
   config_led();
+  config_buttons_gpio();
+
+#if 0
+  serial_output_str("Hulubulu!!?!\r\n");
+  for (;;) {
+    long pa = ROM_GPIOPinRead(GPIO_PORTA_BASE, 0x7c);
+    long pb = ROM_GPIOPinRead(GPIO_PORTB_BASE, 0xf0);
+    long pc = ROM_GPIOPinRead(GPIO_PORTC_BASE, 0xf0);
+    long pd = ROM_GPIOPinRead(GPIO_PORTD_BASE, 0xcf);
+    long pe = ROM_GPIOPinRead(GPIO_PORTE_BASE, 0x3c);
+    long pf = ROM_GPIOPinRead(GPIO_PORTF_BASE, 0x10);
+
+    uint32_t status = ((pa >> 2) & 0x1f) | ((pc << 1) & 0xe0) |
+      (((pb >> 4) & 0x0d) | ((pe >> 1) & 0x02) | ((pc >> 3) & 0x10) |
+       ((pf << 1) & 0x20) | ((pd >> 1) & 0x40) | ((pe << 4) & 0x80)) << 8 |
+      ((pd & 0x0d) | ((pe >> 3) & 0x02) | ((pd << 3) & 0x10) |
+       (pb & 0x20) | (pd & 0x40) | ((pe << 2) & 0x80)) << 16;
+    uint32_t i;
+
+    for (i = 0 ; i < 24; ++i)
+    {
+      serial_output_str((status & (1 << i)) ? "." : "*");
+      if (i == 7 || i == 15)
+        serial_output_str("  ");
+    }
+    serial_output_str("\r\n");
+    ROM_SysCtlDelay(MCU_HZ/3/2);
+  }
+#endif
 
   /*
     Configure timer interrupt, used to put a small delay between transmit
@@ -2205,21 +2385,7 @@ int main()
   setup_timer_pwm();
   l6234_disable();
   serial_output_str("Motor controller init done\r\n");
-
-  /*
-    Start the motor slowly, then ramp up speed.
-    That's a primitive way to start up without actually measuring the
-    position of the motor phases with feedback or hall sensors.
-
-    power_factor=0.5 is in fact enough to drive the motor at 25 RPS.
-    However, let's give it a bit more power, just to help it keep the
-    speed stable. Not sure if it makes much of a difference, but damper=0.7
-    is low enough that the motorcontroller chip does not get very hot.
-  */
-  rampup_seconds = 8.0f;
-  mechanical_rps = 25.0f;
-  power_factor = 0.5f;
-  set_motor_target_speed(mechanical_rps, rampup_seconds, power_factor);
+  start_motor();
 
   sofar = 0;
   next_run_num = 0;

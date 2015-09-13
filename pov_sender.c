@@ -1913,25 +1913,44 @@ start_motor(void)
 }
 
 
+static uint8_t button_status = 0;
+
 static void
 check_buttons(void)
 {
-  long buttons = ROM_GPIOPinRead(GPIO_PORTA_BASE, GPIO_PIN_2|GPIO_PIN_3|
-                                 GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6);
-  long switches = ROM_GPIOPinRead(GPIO_PORTC_BASE,
-                                  GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6);
-  uint32_t status = ((buttons >> 2) & 0x1f) | ((switches << 1) & 0xe0);
+  long pa = ROM_GPIOPinRead(GPIO_PORTA_BASE, 0x7c);
+  long pb = ROM_GPIOPinRead(GPIO_PORTB_BASE, 0xf0);
+  long pc = ROM_GPIOPinRead(GPIO_PORTC_BASE, 0xf0);
+  long pd = ROM_GPIOPinRead(GPIO_PORTD_BASE, 0xcf);
+  long pe = ROM_GPIOPinRead(GPIO_PORTE_BASE, 0x3c);
+  long pf = ROM_GPIOPinRead(GPIO_PORTF_BASE, 0x10);
+  uint32_t status = ((pa >> 2) & 0x1f) | ((pc << 1) & 0xe0) |
+    (((pb >> 4) & 0x0d) | ((pe >> 1) & 0x02) | ((pc >> 3) & 0x10) |
+     ((pf << 1) & 0x20) | ((pd >> 1) & 0x40) | ((pe << 4) & 0x80)) << 8 |
+    ((pd & 0x0d) | ((pe >> 3) & 0x02) | ((pd << 3) & 0x10) |
+     (pb & 0x20) | (pd & 0x40) | ((pe << 2) & 0x80)) << 16;
+  /*
+    Let's logical and together the readings from each of the three connectors.
+    That way, the button panel can be connected to any connector, for the
+    same effect.
+  */
+  button_status = ~(status & (status>>8) & (status>>16)) & 0xff;
 
-  /* ToDo: Some anti-prell handling here! */
-  if (status & (1<<7))
+ /* ToDo: Some anti-prell handling here! */
+  if (button_status & (1<<7))
+  {
+    if (!motor_running)
+      start_motor();
+  }
+  else
   {
     if (motor_running)
       stop_motor();
-    else if (!motor_running)
-      start_motor();
   }
 }
 
+
+static uint32_t last_button_time = 0xffffffff;
 
 /*
   Read a packet from USB. A packet is 32 bytes of data.
@@ -1978,7 +1997,20 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
         }
       }
 
-      check_buttons();
+      /* Every 2 milliseconds, read the buttons. */
+      if (last_button_time == 0xffffffff || calc_time(last_button_time) > MCU_HZ/500)
+      {
+        last_button_time = get_time();
+        check_buttons();
+#if 0
+        {
+          uint32_t i;
+          for (i = 0 ; i < 8; ++i)
+            serial_output_str((button_status & (1 << i)) ? "*" : ".");
+          serial_output_str("\r\n");
+        }
+#endif
+      }
     }
     val = recvbuf.buf[t];
     ++t;
@@ -2304,34 +2336,6 @@ int main()
   config_spi(NRF_SSI_BASE);
   config_led();
   config_buttons_gpio();
-
-#if 0
-  serial_output_str("Hulubulu!!?!\r\n");
-  for (;;) {
-    long pa = ROM_GPIOPinRead(GPIO_PORTA_BASE, 0x7c);
-    long pb = ROM_GPIOPinRead(GPIO_PORTB_BASE, 0xf0);
-    long pc = ROM_GPIOPinRead(GPIO_PORTC_BASE, 0xf0);
-    long pd = ROM_GPIOPinRead(GPIO_PORTD_BASE, 0xcf);
-    long pe = ROM_GPIOPinRead(GPIO_PORTE_BASE, 0x3c);
-    long pf = ROM_GPIOPinRead(GPIO_PORTF_BASE, 0x10);
-
-    uint32_t status = ((pa >> 2) & 0x1f) | ((pc << 1) & 0xe0) |
-      (((pb >> 4) & 0x0d) | ((pe >> 1) & 0x02) | ((pc >> 3) & 0x10) |
-       ((pf << 1) & 0x20) | ((pd >> 1) & 0x40) | ((pe << 4) & 0x80)) << 8 |
-      ((pd & 0x0d) | ((pe >> 3) & 0x02) | ((pd << 3) & 0x10) |
-       (pb & 0x20) | (pd & 0x40) | ((pe << 2) & 0x80)) << 16;
-    uint32_t i;
-
-    for (i = 0 ; i < 24; ++i)
-    {
-      serial_output_str((status & (1 << i)) ? "." : "*");
-      if (i == 7 || i == 15)
-        serial_output_str("  ");
-    }
-    serial_output_str("\r\n");
-    ROM_SysCtlDelay(MCU_HZ/3/2);
-  }
-#endif
 
   /*
     Configure timer interrupt, used to put a small delay between transmit

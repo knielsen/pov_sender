@@ -105,8 +105,11 @@
 
 
 /* Communications protocol. */
+#define NRF_PACKET_SIZE 32
+
 #define POV_CMD_CONFIG 255
 #define POV_SUBCMD_SET_CONFIG 1
+#define POV_SUBCMD_KEYPRESSES 2
 
 #define POV_CMD_DEBUG 254
 #define POV_SUBCMD_RESET_TO_BOOTLOADER 255
@@ -714,8 +717,8 @@ nrf_rx(uint8_t *data, uint32_t len,
 {
   uint8_t sendbuf[33], recvbuf[33];
 
-  if (len > 32)
-    len = 32;
+  if (len > NRF_PACKET_SIZE)
+    len = NRF_PACKET_SIZE;
   sendbuf[0] = nRF_R_RX_PAYLOAD;
   bzero(&sendbuf[1], len);
   ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
@@ -729,8 +732,8 @@ nrf_tx(uint8_t *data, uint32_t len,
 {
   uint8_t sendbuf[33], recvbuf[33];
 
-  if (len > 32)
-    len = 32;
+  if (len > NRF_PACKET_SIZE)
+    len = NRF_PACKET_SIZE;
   sendbuf[0] = nRF_W_TX_PAYLOAD;
   memcpy(&sendbuf[1], data, len);
   ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
@@ -743,8 +746,8 @@ nrf_tx_nack(uint8_t *data, uint32_t len,
 {
   uint8_t sendbuf[33], recvbuf[33];
 
-  if (len > 32)
-    len = 32;
+  if (len > NRF_PACKET_SIZE)
+    len = NRF_PACKET_SIZE;
   sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
   memcpy(&sendbuf[1], data, len);
   ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
@@ -1334,7 +1337,7 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
   nrf_write_reg_n(nRF_RX_ADDR_P0, nrf_addr, 3, ssi_base, csn_base, csn_pin);
   nrf_write_reg_n(nRF_TX_ADDR, nrf_addr, 3, ssi_base, csn_base, csn_pin);
   /* Set payload size for pipe 0. */
-  nrf_write_reg(nRF_RX_PW_P0, 32, ssi_base, csn_base, csn_pin);
+  nrf_write_reg(nRF_RX_PW_P0, NRF_PACKET_SIZE, ssi_base, csn_base, csn_pin);
   /* Disable pipe 1-5. */
   nrf_write_reg(nRF_RX_PW_P1, 0, ssi_base, csn_base, csn_pin);
   /* Disable dynamic payload length. */
@@ -1549,9 +1552,9 @@ my_fill_packet(uint8_t *buf, void *d)
   uint32_t i;
   uint8_t *src = &frame_buffers[write_idx][write_sofar];
 
-  for (i = 0; i < 32; ++i)
+  for (i = 0; i < NRF_PACKET_SIZE; ++i)
     *buf++ = *src++;
-  write_sofar += 32;
+  write_sofar += NRF_PACKET_SIZE;
   return (write_sofar < BUF_SIZE_PAD);
 }
 
@@ -1914,6 +1917,7 @@ start_motor(void)
 
 
 static uint8_t button_status = 0;
+static uint8_t prev_button_status = 0;
 
 static void
 check_buttons(void)
@@ -1953,7 +1957,7 @@ check_buttons(void)
 static uint32_t last_button_time = 0xffffffff;
 
 /*
-  Read a packet from USB. A packet is 32 bytes of data.
+  Read a packet from USB. A packet is 32 (NRF_PACKET_SIZE) bytes of data.
 
   Handles sync-up by resetting the state (and resetting the packet buffer to
   empty) whenever more than 0.2 seconds pass without any data received.
@@ -1973,7 +1977,7 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
 
   if (max_reset_count > 0)
     *timeout_flag = 0;
-  while (sofar < 32)
+  while (sofar < NRF_PACKET_SIZE)
   {
     t = recvbuf.tail;
     start_time = get_time();
@@ -2010,6 +2014,22 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
           serial_output_str("\r\n");
         }
 #endif
+
+        /* ToDo: Only if not sending framebuffer data, and no partial usb packet */
+        {
+          uint8_t cur = button_status;
+          uint8_t prev = prev_button_status;
+          /* ToDo: Also repeat N times every 2 ms for retransmission in case of lost packet. */
+          if (cur != prev)
+          {
+            /* Create a fake packet containing key presses. */
+            packet_buf[0] = POV_CMD_CONFIG;
+            packet_buf[1] = POV_CMD_CONFIG;
+            packet_buf[2] = cur;
+            memset(packet_buf+3, 0, NRF_PACKET_SIZE-3);
+            return reset;
+          }
+        }
       }
     }
     val = recvbuf.buf[t];
@@ -2079,7 +2099,7 @@ nrf_transmit_packet_nack(uint8_t *packet)
 {
   uint32_t start_time = get_time();
 
-  nrf_tx_nack(packet, 32, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+  nrf_tx_nack(packet, NRF_PACKET_SIZE, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
   ce_high(NRF_CE_BASE, NRF_CE_PIN);
   delay_us(10);
   ce_low(NRF_CE_BASE, NRF_CE_PIN);
@@ -2131,7 +2151,7 @@ nrf_transmit_packet(uint8_t *packet)
   uint32_t start_time = get_time();
   const char *errmsg;
 
-  nrf_tx(packet, 32, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+  nrf_tx(packet, NRF_PACKET_SIZE, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
   ce_high(NRF_CE_BASE, NRF_CE_PIN);
   delay_us(10);
   ce_low(NRF_CE_BASE, NRF_CE_PIN);
@@ -2256,7 +2276,8 @@ handle_cmd_debug(uint8_t *packet)
         errmsg = "E: Timeout waiting for reply from bootloader\r\n";
       else
       {
-        nrf_rx(packet, 32, NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
+        nrf_rx(packet, NRF_PACKET_SIZE,
+               NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
         if (packet[0] != POV_CMD_DEBUG || packet[1] != POV_SUBCMD_STATUS_REPLY)
           errmsg = "E: Unexpected reply packet from bootloader\r\n";
         else if (packet[2])
@@ -2287,7 +2308,7 @@ handle_cmd_debug(uint8_t *packet)
 
 
 static void
-handle_cmd_config(uint8_t *packet)
+handle_cmd_set_config(uint8_t *packet)
 {
   /* First we need to wait for any on-going transmit to complete. */
   while (transmit_running)
@@ -2304,6 +2325,13 @@ handle_cmd_config(uint8_t *packet)
   delay_us(40000);
   nrf_transmit_packet_nack(packet);
   delay_us(40000);
+}
+
+
+static void
+handle_cmd_keypress(uint8_t *packet)
+{
+  /* So we need to queue the packet somewhere, and start transmission. */
 }
 
 
@@ -2400,7 +2428,7 @@ int main()
   {
     uint32_t i;
     uint8_t val;
-    uint8_t usb_packet[32];
+    uint8_t usb_packet[NRF_PACKET_SIZE];
 
     /* Wait for a packet on the USB. */
     if (usb_get_packet(usb_packet, 0, NULL))
@@ -2420,7 +2448,10 @@ int main()
     }
     else if (val == POV_CMD_CONFIG)
     {
-      handle_cmd_config(usb_packet);
+      if (usb_packet[1] == POV_SUBCMD_SET_CONFIG)
+        handle_cmd_set_config(usb_packet);
+      else if (usb_packet[1] == POV_SUBCMD_KEYPRESSES)
+        handle_cmd_keypress(usb_packet);
       continue;
     }
 
@@ -2443,7 +2474,7 @@ int main()
     ++next_run_num;
 
     /* Copy the packet into the frame buffer for later bulk sending. */
-    for (i = 0; i < 32; ++i)
+    for (i = 0; i < NRF_PACKET_SIZE; ++i)
       frame_buffers[read_idx][sofar++] = usb_packet[i];
     if (sofar >= BUF_SIZE_PAD)
     {

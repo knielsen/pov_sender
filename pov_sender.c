@@ -119,6 +119,8 @@
 #define POV_SUBCMD_EXIT_DEBUG   251
 #define POV_SUBCMD_STATUS_REPLY 240
 
+/* Total number of times a key is transmittet (for redundancy). */
+#define KEY_RETRANSMITS 8
 
 /* To change this, must fix clock setup in the code. */
 #define MCU_HZ 80000000
@@ -1451,9 +1453,13 @@ config_interrupts(void)
 /* nRF24L01+ communications. */
 
 static uint32_t write_sofar;
+static uint32_t write_howmuch;
 static struct nrf_async_transmit_multi transmit_multi_state;
 static volatile uint8_t transmit_multi_running = 0;
-static volatile uint8_t transmit_running = 0;
+#define TRANSMIT_RUNNING_NO 0
+#define TRANSMIT_RUNNING_FRAMEDATA 1
+#define TRANSMIT_RUNNING_KEYPRESSES 2
+static volatile uint8_t transmit_running = TRANSMIT_RUNNING_NO;
 
 
 static void (* volatile timer2a_cb)(void *);
@@ -1493,7 +1499,7 @@ static void
 handle_end_of_transmit_burst(void)
 {
   transmit_multi_running = 0;
-  if (write_sofar < BUF_SIZE_PAD)
+  if (write_sofar < write_howmuch)
   {
     /*
       Wait 20 microseconds, then start another write burst.
@@ -1504,7 +1510,7 @@ handle_end_of_transmit_burst(void)
     timer2a_set_delay(MCU_HZ/1000000*20, start_next_burst, NULL);
   }
   else
-    transmit_running = 0;
+    transmit_running = TRANSMIT_RUNNING_NO;
 }
 
 
@@ -1555,7 +1561,7 @@ my_fill_packet(uint8_t *buf, void *d)
   for (i = 0; i < NRF_PACKET_SIZE; ++i)
     *buf++ = *src++;
   write_sofar += NRF_PACKET_SIZE;
-  return (write_sofar < BUF_SIZE_PAD);
+  return (write_sofar < write_howmuch);
 }
 
 
@@ -1601,7 +1607,7 @@ dec_time(uint32_t val, uint32_t inc)
 /* Start the next write burst (unless we are done). */
 static void start_next_burst(void *dummy)
 {
-  if (write_sofar < BUF_SIZE_PAD)
+  if (write_sofar < write_howmuch)
   {
     transmit_multi_running = 1;
     nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
@@ -1612,14 +1618,31 @@ static void start_next_burst(void *dummy)
                                    NRF_IRQ_BASE, NRF_IRQ_PIN);
   }
   else
-    transmit_running = 0;
+    transmit_running = TRANSMIT_RUNNING_NO;
 }
 
 
 static void
-transmit_start(void)
+transmit_start_framedata(void)
 {
-  transmit_running = 1;
+  transmit_running = TRANSMIT_RUNNING_FRAMEDATA;
+  write_howmuch = BUF_SIZE_PAD;
+  write_sofar = 0;
+  transmit_multi_running = 1;
+  nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
+                                 NULL, BURSTSIZE, NRF_SSI_BASE,
+                                 NRF_DMA_CH_RX, NRF_DMA_CH_TX,
+                                 NRF_CSN_BASE, NRF_CSN_PIN,
+                                 NRF_CE_BASE, NRF_CE_PIN,
+                                 NRF_IRQ_BASE, NRF_IRQ_PIN);
+}
+
+
+static void
+transmit_start_keypresses(uint32_t howmuch)
+{
+  transmit_running = TRANSMIT_RUNNING_KEYPRESSES;
+  write_howmuch = howmuch;
   write_sofar = 0;
   transmit_multi_running = 1;
   nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
@@ -1955,6 +1978,9 @@ check_buttons(void)
 
 
 static uint32_t last_button_time = 0xffffffff;
+static uint32_t keypress_retransmit = 0;
+static uint32_t keydata_sofar = 0;
+static uint32_t usb_sofar = 0;
 
 /*
   Read a packet from USB. A packet is 32 (NRF_PACKET_SIZE) bytes of data.
@@ -1971,6 +1997,7 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
   uint32_t reset = 0;
   uint32_t sofar = 0;
   uint32_t start_time;
+  uint32_t cur_time;
   uint8_t val;
   uint32_t h, t;
   uint32_t reset_count;
@@ -2002,9 +2029,12 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
       }
 
       /* Every 2 milliseconds, read the buttons. */
-      if (last_button_time == 0xffffffff || calc_time(last_button_time) > MCU_HZ/500)
+      cur_time = get_time();
+      if (last_button_time == 0xffffffff ||
+          calc_time_from_val(last_button_time, cur_time) > MCU_HZ/500 ||
+          (keydata_sofar > 0 && !transmit_running))
       {
-        last_button_time = get_time();
+        last_button_time = cur_time;
         check_buttons();
 #if 0
         {
@@ -2015,18 +2045,35 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
         }
 #endif
 
-        /* ToDo: Only if not sending framebuffer data, and no partial usb packet */
+        /* Only if not sending framebuffer data, and no partial usb packet */
+        if (transmit_running != TRANSMIT_RUNNING_FRAMEDATA && usb_sofar == 0)
         {
           uint8_t cur = button_status;
           uint8_t prev = prev_button_status;
-          /* ToDo: Also repeat N times every 2 ms for retransmission in case of lost packet. */
-          if (cur != prev)
+          /*
+            We return a keypress packet if key state has changed. And after
+            such change, we return further keypress packets to increase the
+            likeliness that at least one will arrive even in case of noise on
+            the wireless transmission.
+
+            We also return a keypress packet if there is any existing keypress
+            data pending, and the nRf interrupt state machine is ready to send
+            a new batch.
+           */
+          if (cur != prev ||
+              keypress_retransmit > 0 ||
+              (keydata_sofar > 0 && !transmit_running))
           {
+            if (cur != prev)
+              keypress_retransmit = KEY_RETRANSMITS;
             /* Create a fake packet containing key presses. */
             packet_buf[0] = POV_CMD_CONFIG;
-            packet_buf[1] = POV_CMD_CONFIG;
+            packet_buf[1] = POV_SUBCMD_KEYPRESSES;
             packet_buf[2] = cur;
             memset(packet_buf+3, 0, NRF_PACKET_SIZE-3);
+            prev_button_status = cur;
+            if (keypress_retransmit > 0)
+              --keypress_retransmit;
             return reset;
           }
         }
@@ -2328,18 +2375,10 @@ handle_cmd_set_config(uint8_t *packet)
 }
 
 
-static void
-handle_cmd_keypress(uint8_t *packet)
-{
-  /* So we need to queue the packet somewhere, and start transmission. */
-}
-
-
 int main()
 {
   uint8_t status;
   uint8_t val;
-  uint32_t sofar;
   uint8_t next_run_num;
   uint32_t read_idx;
   uint32_t corruption_flag;
@@ -2419,7 +2458,7 @@ int main()
   serial_output_str("Motor controller init done\r\n");
   start_motor();
 
-  sofar = 0;
+  usb_sofar = 0;
   next_run_num = 0;
   corruption_flag = 1;
   read_idx = 0;
@@ -2438,6 +2477,7 @@ int main()
         We do not want to transmit a half-received frame to the POV.
       */
       next_run_num = 0;
+      usb_sofar = 0;
     }
     val = usb_packet[0];
 
@@ -2451,7 +2491,33 @@ int main()
       if (usb_packet[1] == POV_SUBCMD_SET_CONFIG)
         handle_cmd_set_config(usb_packet);
       else if (usb_packet[1] == POV_SUBCMD_KEYPRESSES)
-        handle_cmd_keypress(usb_packet);
+      {
+        if (usb_sofar == 0)
+        {
+          if (keydata_sofar + NRF_PACKET_SIZE <= BUF_SIZE_PAD)
+          {
+            memcpy(&frame_buffers[read_idx][keydata_sofar],
+                   usb_packet, NRF_PACKET_SIZE);
+            keydata_sofar += NRF_PACKET_SIZE;
+          }
+          if (!transmit_running)
+          {
+            write_idx = read_idx;
+            read_idx = (1 - read_idx);
+            transmit_start_keypresses(keydata_sofar);
+            keydata_sofar = 0;
+          }
+        }
+        else
+          serial_output_str("Skip key due to framedata\r\n");
+      }
+      continue;
+    }
+
+    /* Framebuffer data packet. */
+    if (keydata_sofar)
+    {
+      /* No room for framebuffer data due to active keypress buffering. */
       continue;
     }
 
@@ -2475,16 +2541,16 @@ int main()
 
     /* Copy the packet into the frame buffer for later bulk sending. */
     for (i = 0; i < NRF_PACKET_SIZE; ++i)
-      frame_buffers[read_idx][sofar++] = usb_packet[i];
-    if (sofar >= BUF_SIZE_PAD)
+      frame_buffers[read_idx][usb_sofar++] = usb_packet[i];
+    if (usb_sofar >= BUF_SIZE_PAD)
     {
-      sofar = 0;
+      usb_sofar = 0;
       next_run_num = 0;
       if (!transmit_running)
       {
         write_idx = read_idx;
         read_idx = (1 - read_idx);
-        transmit_start();
+        transmit_start_framedata();
       }
       else
       {

@@ -620,6 +620,42 @@ config_spi(uint32_t base)
 }
 
 
+static void
+config_spi_ps2()
+{
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI3);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
+  ROM_GPIOPinConfigure(GPIO_PD0_SSI3CLK);
+  ROM_GPIOPinConfigure(GPIO_PD2_SSI3RX);
+  ROM_GPIOPinConfigure(GPIO_PD3_SSI3TX);
+  ROM_GPIOPinTypeSSI(GPIO_PORTD_BASE, GPIO_PIN_0|GPIO_PIN_2|GPIO_PIN_3);
+  /* Pull-up is needed on "data". */
+  ROM_GPIOPadConfigSet(GPIO_PORTD_BASE, GPIO_PIN_2,
+                       GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOE);
+  ROM_GPIODirModeSet(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_DIR_MODE_OUT);
+  ROM_GPIOPadConfigSet(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_STRENGTH_2MA,
+                       GPIO_PIN_TYPE_STD);
+  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_PIN_5);
+
+  /*
+    Configure the SPI for correct mode to talk to PS2 DualShock2 controller.
+
+    We need CLK active low, so SPO=1.
+    We need to setup on leading, sample on trailing CLK edge, so SPH=1.
+
+    The speed is 500 kHz.
+    Source: http://store.curiousinventor.com/guides/PS2/
+  */
+
+  ROM_SSIDisable(SSI3_BASE);
+  ROM_SSIConfigSetExpClk(SSI3_BASE, ROM_SysCtlClockGet(), SSI_FRF_MOTO_MODE_3,
+                         SSI_MODE_MASTER, 500000, 8);
+  ROM_SSIEnable(SSI3_BASE);
+}
+
+
 static uint32_t udma_control_block[256] __attribute__ ((aligned(1024)));
 static void
 config_udma_for_spi(void)
@@ -645,6 +681,36 @@ config_udma_for_spi(void)
   ROM_uDMAChannelAssign(UDMA_CH24_SSI1RX);
   ROM_uDMAChannelAttributeEnable(NRF_DMA_CH_RX, UDMA_ATTR_USEBURST);
   ROM_uDMAChannelControlSet(NRF_DMA_CH_RX | UDMA_PRI_SELECT,
+                            UDMA_SIZE_8 | UDMA_DST_INC_8 | UDMA_SRC_INC_NONE |
+                            UDMA_ARB_4);
+}
+
+
+#define SSI_PS2_TXDMA_CHAN_ASSIGN UDMA_CH15_SSI3TX
+#define SSI_PS2_TXDMA (SSI_PS2_TXDMA_CHAN_ASSIGN & 0xff)
+#define SSI_PS2_RXDMA_CHAN_ASSIGN UDMA_CH14_SSI3RX
+#define SSI_PS2_RXDMA (SSI_PS2_RXDMA_CHAN_ASSIGN & 0xff)
+
+static void
+config_udma_for_ps2(void)
+{
+  ROM_SSIDMAEnable(SSI3_BASE, SSI_DMA_TX);
+  ROM_SSIDMAEnable(SSI3_BASE, SSI_DMA_RX);
+  ROM_IntEnable(INT_SSI3);
+
+  ROM_uDMAChannelAttributeDisable(SSI_PS2_TXDMA, UDMA_ATTR_ALTSELECT |
+                                  UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
+  ROM_uDMAChannelAssign(SSI_PS2_TXDMA_CHAN_ASSIGN);
+  ROM_uDMAChannelAttributeEnable(SSI_PS2_TXDMA, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(SSI_PS2_TXDMA | UDMA_PRI_SELECT,
+                            UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
+                            UDMA_ARB_4);
+
+  ROM_uDMAChannelAttributeDisable(SSI_PS2_RXDMA, UDMA_ATTR_ALTSELECT |
+                                  UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
+  ROM_uDMAChannelAssign(SSI_PS2_RXDMA_CHAN_ASSIGN);
+  ROM_uDMAChannelAttributeEnable(SSI_PS2_RXDMA, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(SSI_PS2_RXDMA | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_DST_INC_8 | UDMA_SRC_INC_NONE |
                             UDMA_ARB_4);
 }
@@ -710,6 +776,156 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 
   /* Take CSN high to complete transfer. */
   csn_high(csn_base, csn_pin);
+}
+
+
+static inline uint8_t RBIT(uint8_t byte_val)
+{
+  uint32_t res;
+  uint32_t word_val = byte_val;
+  __asm ("rbit %0, %1" : "=r" (res) : "r" (word_val));
+  return res>>24;
+}
+
+
+static void
+ps2_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len)
+{
+  uint32_t i;
+  uint32_t data;
+
+  /* Take "attention" low to initiate transfer. */
+  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, 0);
+  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/32));
+
+  for (i = 0; i < len; ++i)
+  {
+    ROM_SSIDataPut(SSI3_BASE, RBIT(sendbuf[i]));
+    while (ROM_SSIBusy(SSI3_BASE))
+      ;
+    ROM_SSIDataGet(SSI3_BASE, &data);
+    recvbuf[i] = RBIT(data);
+
+    ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/16));
+  }
+
+  /* Take "attention" high to complete transfer. */
+  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_PIN_5);
+}
+
+
+static void
+test_ps2(void)
+{
+  uint8_t sndbuf[21], rcvbuf[21];
+  uint32_t i;
+  uint32_t counter;
+
+  /* Do an initial poll (ToDO: could check response to detect missing controller. */
+  sndbuf[0] = 0x01;
+  sndbuf[1] = 0x42;
+  sndbuf[2] = 0x00;
+  sndbuf[3] = 0x00;
+  sndbuf[4] = 0x00;
+  ps2_cmd(rcvbuf, sndbuf, 5);
+  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
+
+  /* Enter config/escape mode. */
+  sndbuf[0] = 0x01;
+  sndbuf[1] = 0x43;
+  sndbuf[2] = 0x00;
+  sndbuf[3] = 0x01;  // enter config/escape mode.
+  sndbuf[4] = 0x00;
+  ps2_cmd(rcvbuf, sndbuf, 5);
+  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
+
+  /* Enable and lock analog mode. */
+  sndbuf[0] = 0x01;
+  sndbuf[1] = 0x44;
+  sndbuf[2] = 0x00;
+  sndbuf[3] = 0x01;  // Enable analog
+  sndbuf[4] = 0x03;  // Lock analog (user can not press button to disable)
+  sndbuf[5] = 0x00;
+  sndbuf[6] = 0x00;
+  sndbuf[7] = 0x00;
+  sndbuf[8] = 0x00;
+  ps2_cmd(rcvbuf, sndbuf, 9);
+  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
+
+#ifdef VIBRATION_NOT_DISABLED
+  /* Set vibration motor mapping. */
+  sndbuf[0] = 0x01;
+  sndbuf[1] = 0x4d;
+  sndbuf[2] = 0x00;
+  sndbuf[3] = 0x00;
+  sndbuf[4] = 0x01;
+  sndbuf[5] = 0xff;
+  sndbuf[6] = 0xff;
+  sndbuf[7] = 0xff;
+  sndbuf[8] = 0xff;
+  ps2_cmd(rcvbuf, sndbuf, 9);
+  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
+#endif
+
+  /* Configure to return key pressure sensitivity. */
+  sndbuf[0] = 0x01;
+  sndbuf[1] = 0x4f;
+  sndbuf[2] = 0x00;
+  sndbuf[3] = 0xff;  // 18 set bits enable 18 response bytes in poll command
+  sndbuf[4] = 0xff;
+  sndbuf[5] = 0x03;
+  sndbuf[6] = 0x00;
+  sndbuf[7] = 0x00;
+  sndbuf[8] = 0x00;
+  ps2_cmd(rcvbuf, sndbuf, 9);
+  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
+
+  /* Exit config mode. */
+  sndbuf[0] = 0x01;
+  sndbuf[1] = 0x43;
+  sndbuf[2] = 0x00;
+  sndbuf[3] = 0x00;  // exit config/escape mode.
+  sndbuf[4] = 0x5a;
+  sndbuf[5] = 0x5a;
+  sndbuf[6] = 0x5a;
+  sndbuf[7] = 0x5a;
+  sndbuf[8] = 0x5a;
+  ps2_cmd(rcvbuf, sndbuf, 9);
+  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
+
+  counter = 0;
+  for (;;)
+  {
+    serial_output_str("Trying PS2 command...");
+    println_uint32(counter++);
+    sndbuf[0] = 0x01;
+    sndbuf[1] = 0x42;
+    sndbuf[2] = 0x00;
+    sndbuf[3] = 0x00;
+    sndbuf[4] = 0x00;
+    sndbuf[5] = 0x00;
+    sndbuf[6] = 0x00;
+    sndbuf[7] = 0x00;
+    sndbuf[8] = 0x00;
+    sndbuf[9] = 0x00;
+    sndbuf[10] = 0x00;
+    sndbuf[11] = 0x00;
+    sndbuf[12] = 0x00;
+    sndbuf[13] = 0x00;
+    sndbuf[14] = 0x00;
+    sndbuf[15] = 0x00;
+    sndbuf[16] = 0x00;
+    sndbuf[17] = 0x00;
+    sndbuf[18] = 0x00;
+    sndbuf[19] = 0x00;
+    sndbuf[20] = 0x00;
+    ps2_cmd(rcvbuf, sndbuf, 21);
+    serial_output_str("Got response: ");
+    for (i = 0; i < 21; ++i)
+      serial_output_hexbyte(rcvbuf[i]);
+    serial_output_str("\r\n");
+    ROM_SysCtlDelay(MCU_HZ/3/10);
+  }
 }
 
 
@@ -2402,7 +2618,10 @@ int main()
   config_ssi_gpio();
   config_spi(NRF_SSI_BASE);
   config_led();
-  config_buttons_gpio();
+  //config_buttons_gpio();
+  config_spi_ps2();
+  test_ps2();
+  for (;;) ;
 
   /*
     Configure timer interrupt, used to put a small delay between transmit

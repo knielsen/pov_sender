@@ -686,6 +686,15 @@ config_udma_for_spi(void)
 }
 
 
+static volatile uint8_t ps2_dma_running = 0;
+
+void
+IntHandlerSSI3(void)
+{
+  ps2_dma_running = 0;
+}
+
+
 #define SSI_PS2_TXDMA_CHAN_ASSIGN UDMA_CH15_SSI3TX
 #define SSI_PS2_TXDMA (SSI_PS2_TXDMA_CHAN_ASSIGN & 0xff)
 #define SSI_PS2_RXDMA_CHAN_ASSIGN UDMA_CH14_SSI3RX
@@ -694,18 +703,18 @@ config_udma_for_spi(void)
 static void
 config_udma_for_ps2(void)
 {
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_UDMA);
+  ROM_uDMAEnable();
+  ROM_uDMAControlBaseSet(udma_control_block);
+
   ROM_SSIDMAEnable(SSI3_BASE, SSI_DMA_TX);
   ROM_SSIDMAEnable(SSI3_BASE, SSI_DMA_RX);
   ROM_IntEnable(INT_SSI3);
 
-  ROM_uDMAChannelAttributeDisable(SSI_PS2_TXDMA, UDMA_ATTR_ALTSELECT |
-                                  UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
-  ROM_uDMAChannelAssign(SSI_PS2_TXDMA_CHAN_ASSIGN);
-  ROM_uDMAChannelAttributeEnable(SSI_PS2_TXDMA, UDMA_ATTR_USEBURST);
-  ROM_uDMAChannelControlSet(SSI_PS2_TXDMA | UDMA_PRI_SELECT,
-                            UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
-                            UDMA_ARB_4);
-
+  /*
+    Setup uDMA channel for SSI3 Rx.
+    (The Tx part is handled by TIMER1 uDMA, not SSI3 uDMA).
+  */
   ROM_uDMAChannelAttributeDisable(SSI_PS2_RXDMA, UDMA_ATTR_ALTSELECT |
                                   UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
   ROM_uDMAChannelAssign(SSI_PS2_RXDMA_CHAN_ASSIGN);
@@ -713,6 +722,21 @@ config_udma_for_ps2(void)
   ROM_uDMAChannelControlSet(SSI_PS2_RXDMA | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_DST_INC_8 | UDMA_SRC_INC_NONE |
                             UDMA_ARB_4);
+
+  /* Set up TIMER1A to trigger a DMA request every 32 us. */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER1);
+  /* Timer 1B not used currently. */
+  ROM_TimerConfigure(TIMER1_BASE, TIMER_CFG_SPLIT_PAIR|
+                 TIMER_CFG_A_PERIODIC|TIMER_CFG_B_PERIODIC);
+  /* 32 us * 80e6 cycles/s -> 2560. */
+  ROM_TimerPrescaleSet(TIMER1_BASE, TIMER_A, 0);
+  ROM_TimerLoadSet(TIMER1_BASE, TIMER_A, MCU_HZ/1000000*32);
+  ROM_uDMAChannelAssign(UDMA_CH20_TIMER1A);
+  ROM_uDMAChannelAttributeDisable(UDMA_CH20_TIMER1A, UDMA_ATTR_ALTSELECT |
+                                  UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
+  ROM_uDMAChannelControlSet(UDMA_CH20_TIMER1A | UDMA_PRI_SELECT,
+                        UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
+                        UDMA_ARB_1);
 }
 
 
@@ -789,26 +813,37 @@ static inline uint8_t RBIT(uint8_t byte_val)
 
 
 static void
-ps2_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len)
+ps2_cmd(uint8_t *recvbuf, uint8_t *sendbuf, uint32_t len)
 {
   uint32_t i;
-  uint32_t data;
 
   /* Take "attention" low to initiate transfer. */
   ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, 0);
-  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/32));
-
+  /* DualShock needs little-endian, but Tiva SSI is big-endian. */
   for (i = 0; i < len; ++i)
-  {
-    ROM_SSIDataPut(SSI3_BASE, RBIT(sendbuf[i]));
-    while (ROM_SSIBusy(SSI3_BASE))
-      ;
-    ROM_SSIDataGet(SSI3_BASE, &data);
-    recvbuf[i] = RBIT(data);
+    sendbuf[i] = RBIT(sendbuf[i]);
 
-    ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/16));
-  }
+  /*
+    Start a timer to trigger uDMA transfers to the SSI Tx register.
+    This way, we can get delays between individual bytes, as required by
+    the DualShock2 controller, and still use uDMA for the transfer.
+  */
+  ps2_dma_running = 1;
+  ROM_uDMAChannelTransferSet(UDMA_CH14_SSI3RX | UDMA_PRI_SELECT,
+                             UDMA_MODE_BASIC, (void *)(SSI3_BASE + SSI_O_DR),
+                             recvbuf, len);
+  ROM_uDMAChannelEnable(UDMA_CH14_SSI3RX);
+  ROM_uDMAChannelTransferSet(UDMA_CH20_TIMER1A | UDMA_PRI_SELECT,
+                             UDMA_MODE_BASIC, sendbuf,
+                             (void *)(SSI3_BASE + SSI_O_DR), len);
+  ROM_uDMAChannelEnable(UDMA_CH20_TIMER1A);
+  ROM_TimerEnable(TIMER1_BASE, TIMER_A);
 
+  while (ps2_dma_running)
+    ;
+  ROM_TimerDisable(TIMER1_BASE, TIMER_A);
+  for (i = 0; i < len; ++i)
+    recvbuf[i] = RBIT(recvbuf[i]);
   /* Take "attention" high to complete transfer. */
   ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_PIN_5);
 }
@@ -2620,6 +2655,7 @@ int main()
   config_led();
   //config_buttons_gpio();
   config_spi_ps2();
+  config_udma_for_ps2();
   test_ps2();
   for (;;) ;
 

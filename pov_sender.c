@@ -686,12 +686,132 @@ config_udma_for_spi(void)
 }
 
 
+static inline uint8_t RBIT(uint8_t byte_val)
+{
+  uint32_t res;
+  uint32_t word_val = byte_val;
+  __asm ("rbit %0, %1" : "=r" (res) : "r" (word_val));
+  return res>>24;
+}
+
+
+/*
+  The Tiva SSI peripheral uses MSB first, but DualShock controller needs LSB
+  first. This compile-time macro allows to bitflip a constant value as needed.
+  The RBIT() function is a more efficient way to do this at runtime.
+*/
+#define R_(x) ((((x)&0x1) << 7) | (((x)&0x2) << 5) | (((x)&0x4) << 3) | \
+               (((x)&0x8) << 1) | (((x)&0x10) >> 1) | (((x)&0x20) >> 3) \
+               | (((x)&0x50) >> 5) | (((x)&0x80) >> 7))
+struct { uint32_t len; uint8_t data[21]; } ps2_cmds[] = {
+  /* Do an initial poll to check response and detect missing controller. */
+  { 5, { R_(0x01), R_(0x42), 0, 0, 0}},
+  /* Enter config/escape mode. */
+  { 5, { R_(0x01), R_(0x43), 0, R_(0x01) /* Enter config/escape mode */, 0}},
+  /* Enable and lock analog mode. */
+  { 9, { R_(0x01), R_(0x44), 0, R_(0x01) /* Enable analog */,
+         R_(0x03) /* Lock analog mode */, 0, 0, 0, 0}},
+#if 0
+  /* Set vibration motor mapping. */
+  { 9, { R_(0x01), R_(0x4d), 0, 0, R_(0x01), 0xff, 0xff, 0xff, 0xff}},
+#endif
+  /* Configure to return key pressure sensitivity. */
+  { 9, { R_(0x01), R_(0x4f), 0,
+         0xff, 0xff, R_(0x03) /* 18 set bits enable 18 bytes of response */,
+         0, 0, 0}},
+  /* Exit config mode. */
+  { 9, { R_(0x01), R_(0x43), 0, 0 /* exit config/escape mode */,
+         R_(0x5a), R_(0x5a), R_(0x5a), R_(0x5a), R_(0x5a)}},
+  /* Poll for 18 bytes of extended status (all pressure-sensitive buttons). */
+  { 21, { R_(0x01), R_(0x42), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
+};
+#undef R_
+
+
+static volatile uint32_t ps2_current_cmd_idx = 0;
+static uint8_t ps2_button_state[18] = { 0xff, 0xff, 0x7f, 0x7f, 0x7f, 0x7f };
 static volatile uint8_t ps2_dma_running = 0;
+static uint8_t ps2_recvbuf[21];
 
 void
 IntHandlerSSI3(void)
 {
+  uint32_t i;
+
+  ROM_TimerDisable(TIMER1_BASE, TIMER_A);
+
+  /*
+    Check if a controller is connected.
+    Could refine this check, but perhaps this is sufficient.
+  */
+  if (RBIT(ps2_recvbuf[1]) == 0xff)
+  {
+    /* Clear any currently marked buttons. */
+    if (ps2_current_cmd_idx == sizeof(ps2_cmds)/sizeof(ps2_cmds[0]) - 1)
+    {
+      ps2_button_state[0] = 0xff;
+      ps2_button_state[1] = 0xff;
+      ps2_button_state[2] = 0x7f;
+      ps2_button_state[3] = 0x7f;
+      ps2_button_state[4] = 0x7f;
+      ps2_button_state[5] = 0x7f;
+      memset(ps2_button_state+6, 0, sizeof(ps2_button_state)-6);
+    }
+    /* Reset and start over config if a controller is connected later. */
+    ps2_current_cmd_idx = 0;
+  }
+  else if (ps2_current_cmd_idx == sizeof(ps2_cmds)/sizeof(ps2_cmds[0]) - 1)
+  {
+    /* Got a read, save it. */
+    for (i = 0; i < 18; ++i)
+      ps2_button_state[i] = RBIT(ps2_recvbuf[i+3]);
+  }
+  else
+  {
+    /* Config step successful, move to next step. */
+    ++ps2_current_cmd_idx;
+  }
+
+  /* Take "attention" high to complete transfer. */
+  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_PIN_5);
+
   ps2_dma_running = 0;
+}
+
+
+void
+IntHandlerTimer1B(void)
+{
+  uint8_t *ps2_data;
+  uint32_t ps2_data_len;
+  uint32_t idx;
+
+  ROM_TimerIntClear(TIMER1_BASE, TIMER_TIMB_TIMEOUT);
+  if (ps2_dma_running)
+    return;
+
+  /* Take "attention" low to initiate transfer. */
+  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, 0);
+
+  idx = ps2_current_cmd_idx;
+  ps2_data = ps2_cmds[idx].data;
+  ps2_data_len = ps2_cmds[idx].len;
+
+  /*
+    Start a timer to trigger uDMA transfers to the SSI Tx register.
+    This way, we can get delays between individual bytes, as required by
+    the DualShock2 controller, and still use uDMA for the transfer.
+  */
+  ps2_dma_running = 1;
+  ROM_uDMAChannelTransferSet(UDMA_CH14_SSI3RX | UDMA_PRI_SELECT,
+                             UDMA_MODE_BASIC, (void *)(SSI3_BASE + SSI_O_DR),
+                             ps2_recvbuf, ps2_data_len);
+  ROM_uDMAChannelEnable(UDMA_CH14_SSI3RX);
+  ROM_uDMAChannelTransferSet(UDMA_CH20_TIMER1A | UDMA_PRI_SELECT,
+                             UDMA_MODE_BASIC, ps2_data,
+                             (void *)(SSI3_BASE + SSI_O_DR), ps2_data_len);
+  ROM_uDMAChannelEnable(UDMA_CH20_TIMER1A);
+  ROM_TimerEnable(TIMER1_BASE, TIMER_A);
 }
 
 
@@ -725,18 +845,22 @@ config_udma_for_ps2(void)
 
   /* Set up TIMER1A to trigger a DMA request every 32 us. */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER1);
-  /* Timer 1B not used currently. */
+  /* Timer 1B is used to start a new DualShock controller read every 10 ms. */
   ROM_TimerConfigure(TIMER1_BASE, TIMER_CFG_SPLIT_PAIR|
-                 TIMER_CFG_A_PERIODIC|TIMER_CFG_B_PERIODIC);
+                     TIMER_CFG_A_PERIODIC|TIMER_CFG_B_PERIODIC);
   /* 32 us * 80e6 cycles/s -> 2560. */
   ROM_TimerPrescaleSet(TIMER1_BASE, TIMER_A, 0);
   ROM_TimerLoadSet(TIMER1_BASE, TIMER_A, MCU_HZ/1000000*32);
+  /* 10 ms * 80e6 cycles/s / 100 cycles/tick -> 8000 ticks. */
+  ROM_TimerPrescaleSet(TIMER1_BASE, TIMER_B, 100);
+  ROM_TimerLoadSet(TIMER1_BASE, TIMER_B, MCU_HZ*10/1000/100);
   ROM_uDMAChannelAssign(UDMA_CH20_TIMER1A);
   ROM_uDMAChannelAttributeDisable(UDMA_CH20_TIMER1A, UDMA_ATTR_ALTSELECT |
                                   UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
   ROM_uDMAChannelControlSet(UDMA_CH20_TIMER1A | UDMA_PRI_SELECT,
                         UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
                         UDMA_ARB_1);
+  ROM_TimerIntEnable(TIMER1_BASE, TIMER_TIMB_TIMEOUT);
 }
 
 
@@ -800,167 +924,6 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 
   /* Take CSN high to complete transfer. */
   csn_high(csn_base, csn_pin);
-}
-
-
-static inline uint8_t RBIT(uint8_t byte_val)
-{
-  uint32_t res;
-  uint32_t word_val = byte_val;
-  __asm ("rbit %0, %1" : "=r" (res) : "r" (word_val));
-  return res>>24;
-}
-
-
-static void
-ps2_cmd(uint8_t *recvbuf, uint8_t *sendbuf, uint32_t len)
-{
-  uint32_t i;
-
-  /* Take "attention" low to initiate transfer. */
-  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, 0);
-  /* DualShock needs little-endian, but Tiva SSI is big-endian. */
-  for (i = 0; i < len; ++i)
-    sendbuf[i] = RBIT(sendbuf[i]);
-
-  /*
-    Start a timer to trigger uDMA transfers to the SSI Tx register.
-    This way, we can get delays between individual bytes, as required by
-    the DualShock2 controller, and still use uDMA for the transfer.
-  */
-  ps2_dma_running = 1;
-  ROM_uDMAChannelTransferSet(UDMA_CH14_SSI3RX | UDMA_PRI_SELECT,
-                             UDMA_MODE_BASIC, (void *)(SSI3_BASE + SSI_O_DR),
-                             recvbuf, len);
-  ROM_uDMAChannelEnable(UDMA_CH14_SSI3RX);
-  ROM_uDMAChannelTransferSet(UDMA_CH20_TIMER1A | UDMA_PRI_SELECT,
-                             UDMA_MODE_BASIC, sendbuf,
-                             (void *)(SSI3_BASE + SSI_O_DR), len);
-  ROM_uDMAChannelEnable(UDMA_CH20_TIMER1A);
-  ROM_TimerEnable(TIMER1_BASE, TIMER_A);
-
-  while (ps2_dma_running)
-    ;
-  ROM_TimerDisable(TIMER1_BASE, TIMER_A);
-  for (i = 0; i < len; ++i)
-    recvbuf[i] = RBIT(recvbuf[i]);
-  /* Take "attention" high to complete transfer. */
-  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_PIN_5);
-}
-
-
-static void
-test_ps2(void)
-{
-  uint8_t sndbuf[21], rcvbuf[21];
-  uint32_t i;
-  uint32_t counter;
-
-  /* Do an initial poll (ToDO: could check response to detect missing controller. */
-  sndbuf[0] = 0x01;
-  sndbuf[1] = 0x42;
-  sndbuf[2] = 0x00;
-  sndbuf[3] = 0x00;
-  sndbuf[4] = 0x00;
-  ps2_cmd(rcvbuf, sndbuf, 5);
-  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
-
-  /* Enter config/escape mode. */
-  sndbuf[0] = 0x01;
-  sndbuf[1] = 0x43;
-  sndbuf[2] = 0x00;
-  sndbuf[3] = 0x01;  // enter config/escape mode.
-  sndbuf[4] = 0x00;
-  ps2_cmd(rcvbuf, sndbuf, 5);
-  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
-
-  /* Enable and lock analog mode. */
-  sndbuf[0] = 0x01;
-  sndbuf[1] = 0x44;
-  sndbuf[2] = 0x00;
-  sndbuf[3] = 0x01;  // Enable analog
-  sndbuf[4] = 0x03;  // Lock analog (user can not press button to disable)
-  sndbuf[5] = 0x00;
-  sndbuf[6] = 0x00;
-  sndbuf[7] = 0x00;
-  sndbuf[8] = 0x00;
-  ps2_cmd(rcvbuf, sndbuf, 9);
-  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
-
-#ifdef VIBRATION_NOT_DISABLED
-  /* Set vibration motor mapping. */
-  sndbuf[0] = 0x01;
-  sndbuf[1] = 0x4d;
-  sndbuf[2] = 0x00;
-  sndbuf[3] = 0x00;
-  sndbuf[4] = 0x01;
-  sndbuf[5] = 0xff;
-  sndbuf[6] = 0xff;
-  sndbuf[7] = 0xff;
-  sndbuf[8] = 0xff;
-  ps2_cmd(rcvbuf, sndbuf, 9);
-  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
-#endif
-
-  /* Configure to return key pressure sensitivity. */
-  sndbuf[0] = 0x01;
-  sndbuf[1] = 0x4f;
-  sndbuf[2] = 0x00;
-  sndbuf[3] = 0xff;  // 18 set bits enable 18 response bytes in poll command
-  sndbuf[4] = 0xff;
-  sndbuf[5] = 0x03;
-  sndbuf[6] = 0x00;
-  sndbuf[7] = 0x00;
-  sndbuf[8] = 0x00;
-  ps2_cmd(rcvbuf, sndbuf, 9);
-  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
-
-  /* Exit config mode. */
-  sndbuf[0] = 0x01;
-  sndbuf[1] = 0x43;
-  sndbuf[2] = 0x00;
-  sndbuf[3] = 0x00;  // exit config/escape mode.
-  sndbuf[4] = 0x5a;
-  sndbuf[5] = 0x5a;
-  sndbuf[6] = 0x5a;
-  sndbuf[7] = 0x5a;
-  sndbuf[8] = 0x5a;
-  ps2_cmd(rcvbuf, sndbuf, 9);
-  ROM_SysCtlDelay(MCU_HZ/3/1000/(1000/48));
-
-  counter = 0;
-  for (;;)
-  {
-    serial_output_str("Trying PS2 command...");
-    println_uint32(counter++);
-    sndbuf[0] = 0x01;
-    sndbuf[1] = 0x42;
-    sndbuf[2] = 0x00;
-    sndbuf[3] = 0x00;
-    sndbuf[4] = 0x00;
-    sndbuf[5] = 0x00;
-    sndbuf[6] = 0x00;
-    sndbuf[7] = 0x00;
-    sndbuf[8] = 0x00;
-    sndbuf[9] = 0x00;
-    sndbuf[10] = 0x00;
-    sndbuf[11] = 0x00;
-    sndbuf[12] = 0x00;
-    sndbuf[13] = 0x00;
-    sndbuf[14] = 0x00;
-    sndbuf[15] = 0x00;
-    sndbuf[16] = 0x00;
-    sndbuf[17] = 0x00;
-    sndbuf[18] = 0x00;
-    sndbuf[19] = 0x00;
-    sndbuf[20] = 0x00;
-    ps2_cmd(rcvbuf, sndbuf, 21);
-    serial_output_str("Got response: ");
-    for (i = 0; i < 21; ++i)
-      serial_output_hexbyte(rcvbuf[i]);
-    serial_output_str("\r\n");
-    ROM_SysCtlDelay(MCU_HZ/3/10);
-  }
 }
 
 
@@ -2190,12 +2153,67 @@ start_motor(void)
 }
 
 
-static uint8_t button_status = 0;
-static uint8_t prev_button_status = 0;
+/*
+  Status of all buttons.
+
+  All bits are active high.
+
+  Byte 0:
+   bit 0  button 1 (or L1)
+   bit 1  button 2 (or R1)
+   bit 2  button 2 (or L2)
+   bit 3  button 2 (or R2)
+   bit 4  button 2 (or SELECT)
+   bit 5  switch 1 (also on DualShock controller board)
+   bit 6  switch 2
+   bit 7  switch 3 (also on DualShock controller board)
+
+  Byte 1:
+   bit 0: SELECT
+   bit 1: L3
+   bit 2  R3
+   bit 3  START
+   bit 4  Up
+   bit 5  Right
+   bit 6  Down
+   bit 7  Left
+
+  Byte 2:
+   bit 0: L2
+   bit 1: R2
+   bit 2  L1
+   bit 3  R1
+   bit 4  Triangle
+   bit 5  Circle
+   bit 6  Cross
+   bit 7  Square
+
+  Byte 3: Joystick R left (0x00) -> right (0xff)
+  Byte 4: Joystick R up (0x00) -> down (0xff)
+  Byte 5: Joystick L left (0x00) -> right (0xff)
+  Byte 6: Joystick L up (0x00) -> down (0xff)
+
+  Byte 7: Button "right" pressure sensitivity
+  Byte 8: Button "left" pressure sensitivity
+  Byte 9: Button "up" pressure sensitivity
+  Byte 10: Button "down" pressure sensitivity
+  Byte 11: Button "triangle" pressure sensitivity
+  Byte 12: Button "circle" pressure sensitivity
+  Byte 13: Button "cross" pressure sensitivity
+  Byte 14: Button "square" pressure sensitivity
+  Byte 15: Button "L1" pressure sensitivity
+  Byte 16: Button "R1" pressure sensitivity
+  Byte 17: Button "L2" pressure sensitivity
+  Byte 18: Button "R2" pressure sensitivity
+*/
+static uint8_t button_status[19];
+static uint8_t prev_button_status[19];
 
 static void
 check_buttons(void)
 {
+  uint8_t combined_status;
+  uint32_t ps2_but_status1, ps2_but_status2;
   long pa = ROM_GPIOPinRead(GPIO_PORTA_BASE, 0x7c);
   long pb = ROM_GPIOPinRead(GPIO_PORTB_BASE, 0xf0);
   long pc = ROM_GPIOPinRead(GPIO_PORTC_BASE, 0xf0);
@@ -2211,10 +2229,20 @@ check_buttons(void)
     That way, the button panel can be connected to any connector, for the
     same effect.
   */
-  button_status = ~(status & (status>>8) & (status>>16)) & 0xff;
+  combined_status = ~(status & (status>>8) & (status>>16)) & 0xff;
+  button_status[1] = ~ps2_button_state[0];
+  button_status[2] = ~ps2_button_state[1];
+  memcpy(button_status+3, ps2_button_state+2, 16);
+  ps2_but_status1 = button_status[1];
+  ps2_but_status2 = button_status[2];
+  /* Let some DualShock buttons mirror the small panel buttons. */
+  combined_status |= ((ps2_but_status2 >> 2) & 0x03);
+  combined_status |= ((ps2_but_status2 << 2) & 0x0c);
+  combined_status |= ((ps2_but_status1 << 4) & 0x10);
+  button_status[0] = combined_status;
 
  /* ToDo: Some anti-prell handling here! */
-  if (button_status & (1<<7))
+  if (combined_status & (1<<7))
   {
     if (!motor_running)
       start_motor();
@@ -2289,8 +2317,8 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
 #if 0
         {
           uint32_t i;
-          for (i = 0 ; i < 8; ++i)
-            serial_output_str((button_status & (1 << i)) ? "*" : ".");
+          for (i = 0 ; i < 19; ++i)
+            serial_output_hexbyte(button_status[i]);
           serial_output_str("\r\n");
         }
 #endif
@@ -2298,8 +2326,7 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
         /* Only if not sending framebuffer data, and no partial usb packet */
         if (transmit_running != TRANSMIT_RUNNING_FRAMEDATA && usb_sofar == 0)
         {
-          uint8_t cur = button_status;
-          uint8_t prev = prev_button_status;
+          int diff = memcmp(button_status, prev_button_status, sizeof(button_status));
           /*
             We return a keypress packet if key state has changed. And after
             such change, we return further keypress packets to increase the
@@ -2310,18 +2337,19 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
             data pending, and the nRf interrupt state machine is ready to send
             a new batch.
            */
-          if (cur != prev ||
+          if (diff ||
               keypress_retransmit > 0 ||
               (keydata_sofar > 0 && !transmit_running))
           {
-            if (cur != prev)
+            if (diff)
               keypress_retransmit = KEY_RETRANSMITS;
             /* Create a fake packet containing key presses. */
             packet_buf[0] = POV_CMD_CONFIG;
             packet_buf[1] = POV_SUBCMD_KEYPRESSES;
-            packet_buf[2] = cur;
-            memset(packet_buf+3, 0, NRF_PACKET_SIZE-3);
-            prev_button_status = cur;
+            memcpy(packet_buf+2, button_status, sizeof(button_status));
+            memset(packet_buf+2+sizeof(button_status), 0,
+                   NRF_PACKET_SIZE-(2+sizeof(button_status)));
+            memcpy(prev_button_status, button_status, sizeof(prev_button_status));
             if (keypress_retransmit > 0)
               --keypress_retransmit;
             return reset;
@@ -2653,10 +2681,6 @@ int main()
   config_spi(NRF_SSI_BASE);
   config_led();
   config_buttons_gpio();
-  config_spi_ps2();
-  config_udma_for_ps2();
-//  test_ps2();
-//  for (;;) ;
 
   /*
     Configure timer interrupt, used to put a small delay between transmit
@@ -2679,12 +2703,21 @@ int main()
   ROM_IntPrioritySet(INT_TIMER4A, 0 << 5);
   ROM_IntPrioritySet(INT_TIMER4B, 0 << 5);
   ROM_IntPrioritySet(INT_TIMER5A, 0 << 5);
+  /* Playstation DualShock interrupt priority. */
+  ROM_IntPrioritySet(INT_SSI3, 1 << 5);
+  ROM_IntPrioritySet(INT_TIMER1B, 5 << 5);
+
+  config_spi_ps2();
+  config_udma_for_ps2();
 
   config_usb();
 
   /* Enable interrrupts. */
   ROM_IntMasterEnable();
   ROM_IntEnable(INT_TIMER2A);
+  ROM_IntEnable(INT_TIMER1B);
+  /* Start timer to poll PlayStation 2 DualShock controller periodically. */
+  ROM_TimerEnable(TIMER1_BASE, TIMER_B);
 
   /* nRF24L01+ datasheet says to wait 100msec for bootup. */
   ROM_SysCtlDelay(MCU_HZ/3/10);

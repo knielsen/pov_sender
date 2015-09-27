@@ -71,15 +71,15 @@
     PD7   Switch 2
     PE3   Switch 3
 
-  Connector P3:
-    PD0   Push button 1
-    PE4   Push button 2
-    PD2   Push button 3
-    PD3   Push button 4
-    PD1   Push button 5
+  Connector P3 (connected to playstation 2 / DualShock controller):
+    PD0   PS2 SCLK
+    PE4   PS2 controller 2 "attention" (slave select)
+    PD2   PS2 data
+    PD3   PS2 cmd
+    PD1   Switch 3
     PB5   Switch 1
-    PD6   Switch 2
-    PE5   Switch 3
+    PD6   PS2 ack
+    PE5   PS2 controller 1 "attention"
 */
 
 #define SIZEX 65
@@ -257,7 +257,11 @@ config_buttons_gpio(void)
   ROM_GPIOPadConfigSet(GPIO_PORTC_BASE, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6,
                        GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
 
-  /* Let's setup for connectors P2 and P3 also. */
+  /*
+    Let's setup for connectors P2 and P3 also.
+    P3 has only switch 1 and 3, rest is used for Playstation Dualshock
+    controllers.
+  */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
@@ -271,20 +275,16 @@ config_buttons_gpio(void)
   ROM_GPIODirModeSet(GPIO_PORTB_BASE, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|
                      GPIO_PIN_7, GPIO_DIR_MODE_IN);
   ROM_GPIODirModeSet(GPIO_PORTC_BASE, GPIO_PIN_7, GPIO_DIR_MODE_IN);
-  ROM_GPIODirModeSet(GPIO_PORTD_BASE, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|
-                     GPIO_PIN_3|GPIO_PIN_6|GPIO_PIN_7, GPIO_DIR_MODE_IN);
-  ROM_GPIODirModeSet(GPIO_PORTE_BASE, GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|
-                     GPIO_PIN_5, GPIO_DIR_MODE_IN);
+  ROM_GPIODirModeSet(GPIO_PORTD_BASE, GPIO_PIN_1|GPIO_PIN_7, GPIO_DIR_MODE_IN);
+  ROM_GPIODirModeSet(GPIO_PORTE_BASE, GPIO_PIN_2|GPIO_PIN_3, GPIO_DIR_MODE_IN);
   ROM_GPIODirModeSet(GPIO_PORTF_BASE, GPIO_PIN_4, GPIO_DIR_MODE_IN);
   ROM_GPIOPadConfigSet(GPIO_PORTB_BASE, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|
                        GPIO_PIN_7, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
   ROM_GPIOPadConfigSet(GPIO_PORTC_BASE, GPIO_PIN_7,
                        GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
-  ROM_GPIOPadConfigSet(GPIO_PORTD_BASE, GPIO_PIN_0|GPIO_PIN_1|
-                       GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_6|GPIO_PIN_7,
+  ROM_GPIOPadConfigSet(GPIO_PORTD_BASE, GPIO_PIN_1|GPIO_PIN_7,
                        GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
-  ROM_GPIOPadConfigSet(GPIO_PORTE_BASE, GPIO_PIN_2|GPIO_PIN_3|
-                       GPIO_PIN_4|GPIO_PIN_5,
+  ROM_GPIOPadConfigSet(GPIO_PORTE_BASE, GPIO_PIN_2|GPIO_PIN_3,
                        GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
   ROM_GPIOPadConfigSet(GPIO_PORTF_BASE, GPIO_PIN_4,
                        GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
@@ -2205,8 +2205,7 @@ check_buttons(void)
   uint32_t status = ((pa >> 2) & 0x1f) | ((pc << 1) & 0xe0) |
     (((pb >> 4) & 0x0d) | ((pe >> 1) & 0x02) | ((pc >> 3) & 0x10) |
      ((pf << 1) & 0x20) | ((pd >> 1) & 0x40) | ((pe << 4) & 0x80)) << 8 |
-    ((pd & 0x0d) | ((pe >> 3) & 0x02) | ((pd << 3) & 0x10) |
-     (pb & 0x20) | (pd & 0x40) | ((pe << 2) & 0x80)) << 16;
+    ((pb & 0x20) | ((pd << 6) & 0x80) | 0x5f) << 16;
   /*
     Let's logical and together the readings from each of the three connectors.
     That way, the button panel can be connected to any connector, for the
@@ -2653,11 +2652,11 @@ int main()
   config_ssi_gpio();
   config_spi(NRF_SSI_BASE);
   config_led();
-  //config_buttons_gpio();
+  config_buttons_gpio();
   config_spi_ps2();
   config_udma_for_ps2();
-  test_ps2();
-  for (;;) ;
+//  test_ps2();
+//  for (;;) ;
 
   /*
     Configure timer interrupt, used to put a small delay between transmit

@@ -1519,7 +1519,7 @@ resched:
 }
 
 
-static const uint8_t nrf_addr[3] = { 0xe7, 0xe7, 0xe7 };
+static const uint8_t nrf_addr[3] = { 0x7e, 0xc8, 0x33 };
 
 /*
   Configure nRF24L01+ as Rx or Tx.
@@ -1548,7 +1548,7 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
   nrf_write_reg(nRF_SETUP_RETR, 0, ssi_base, csn_base, csn_pin);
   nrf_write_reg(nRF_RF_CH, channel, ssi_base, csn_base, csn_pin);
   /* Use 2Mbps, and set transmit power. */
-  nrf_write_reg(nRF_RF_SETUP, nRF_RF_DR_HIGH | power,
+  nrf_write_reg(nRF_RF_SETUP, nRF_RF_DR_LOW | power,
                 ssi_base, csn_base, csn_pin);
   nrf_write_reg_n(nRF_RX_ADDR_P0, nrf_addr, 3, ssi_base, csn_base, csn_pin);
   nrf_write_reg_n(nRF_TX_ADDR, nrf_addr, 3, ssi_base, csn_base, csn_pin);
@@ -2725,7 +2725,7 @@ int main()
   serial_output_str("Tx: Setting up...\r\n");
   config_interrupts();
   config_udma_for_spi();
-  nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_0DBM,
+  nrf_init_config(0 /* Tx */, 81, nRF_RF_PWR_0DBM,
                   NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
   serial_output_str("Tx: Read CONFIG=0x");
   val = nrf_read_reg(nRF_CONFIG, &status,

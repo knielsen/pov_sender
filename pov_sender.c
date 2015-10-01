@@ -686,6 +686,20 @@ config_udma_for_spi(void)
 }
 
 
+static inline uint32_t
+my_gpio_read(unsigned long gpio_base, uint32_t bits)
+{
+  return HWREG(gpio_base + GPIO_O_DATA + (bits << 2));
+}
+
+
+static inline void
+my_gpio_write(unsigned long gpio_base, uint32_t bits, uint32_t val)
+{
+  HWREG(gpio_base + GPIO_O_DATA + (bits << 2)) = val;
+}
+
+
 static inline uint8_t RBIT(uint8_t byte_val)
 {
   uint32_t res;
@@ -773,7 +787,7 @@ IntHandlerSSI3(void)
   }
 
   /* Take "attention" high to complete transfer. */
-  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_PIN_5);
+  my_gpio_write(GPIO_PORTE_BASE, GPIO_PIN_5, GPIO_PIN_5);
 
   ps2_dma_running = 0;
 }
@@ -791,7 +805,7 @@ IntHandlerTimer1B(void)
     return;
 
   /* Take "attention" low to initiate transfer. */
-  ROM_GPIOPinWrite(GPIO_PORTE_BASE, GPIO_PIN_5, 0);
+  my_gpio_write(GPIO_PORTE_BASE, GPIO_PIN_5, 0);
 
   idx = ps2_current_cmd_idx;
   ps2_data = ps2_cmds[idx].data;
@@ -878,28 +892,28 @@ bzero(uint8_t *buf, uint32_t len)
 static inline void
 csn_low(uint32_t csn_base, uint32_t csn_pin)
 {
-  ROM_GPIOPinWrite(csn_base, csn_pin, 0);
+  my_gpio_write(csn_base, csn_pin, 0);
 }
 
 
 static inline void
 csn_high(uint32_t csn_base, uint32_t csn_pin)
 {
-  ROM_GPIOPinWrite(csn_base, csn_pin, csn_pin);
+  my_gpio_write(csn_base, csn_pin, csn_pin);
 }
 
 
 static inline void
 ce_low(uint32_t ce_base, uint32_t ce_pin)
 {
-  ROM_GPIOPinWrite(ce_base, ce_pin, 0);
+  my_gpio_write(ce_base, ce_pin, 0);
 }
 
 
 static inline void
 ce_high(uint32_t ce_base, uint32_t ce_pin)
 {
-  ROM_GPIOPinWrite(ce_base, ce_pin, ce_pin);
+  my_gpio_write(ce_base, ce_pin, ce_pin);
 }
 
 
@@ -2150,13 +2164,6 @@ start_motor(void)
   power_factor = 0.5f;
   motor_running = 1;
   set_motor_target_speed(mechanical_rps, rampup_seconds, power_factor);
-}
-
-
-static inline uint32_t
-my_gpio_read(unsigned long gpio_base, uint8_t bits)
-{
-  return HWREG(gpio_base + GPIO_O_DATA + ((uint32_t)bits <<2));
 }
 
 

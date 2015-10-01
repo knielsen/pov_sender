@@ -135,6 +135,9 @@
 
 static const float F_PI = 3.141592654f;
 
+#define likely(x) __builtin_expect((x)!=0, 1)
+#define unlikely(x) __builtin_expect((x)!=0, 0)
+
 static void motor_update(void);
 
 
@@ -686,6 +689,22 @@ config_udma_for_spi(void)
 }
 
 
+static inline void
+hw_set_bit(uint32_t addr, uint32_t bitnum)
+{
+  uint32_t bitband_addr = 0x42000000 + (addr-0x40000000)*32 + bitnum*4;
+  HWREG(bitband_addr) = 1;
+}
+
+
+static inline void
+hw_clear_bit(uint32_t addr, uint32_t bitnum)
+{
+  uint32_t bitband_addr = 0x42000000 + (addr-0x40000000)*32 + bitnum*4;
+  HWREG(bitband_addr) = 0;
+}
+
+
 static inline uint32_t
 my_gpio_read(unsigned long gpio_base, uint32_t bits)
 {
@@ -697,6 +716,54 @@ static inline void
 my_gpio_write(unsigned long gpio_base, uint32_t bits, uint32_t val)
 {
   HWREG(gpio_base + GPIO_O_DATA + (bits << 2)) = val;
+}
+
+
+static inline void
+my_disable_timera(unsigned long timer_base)
+{
+  //HWREG(timer_base + TIMER_O_CTL) &= ~(uint32_t)TIMER_CTL_TAEN;
+  hw_clear_bit(timer_base + TIMER_O_CTL, 0);
+}
+
+
+static inline void
+my_disable_timerb(unsigned long timer_base)
+{
+  //HWREG(timer_base + TIMER_O_CTL) &= ~(uint32_t)TIMER_CTL_TBEN;
+  hw_clear_bit(timer_base + TIMER_O_CTL + 1, 0);
+}
+
+
+static inline void
+my_enable_timera(unsigned long timer_base)
+{
+  //HWREG(timer_base + TIMER_O_CTL) |= (uint32_t)TIMER_CTL_TAEN;
+  hw_set_bit(timer_base + TIMER_O_CTL, 0);
+}
+
+
+static inline void
+my_enable_timerb(unsigned long timer_base)
+{
+  //HWREG(timer_base + TIMER_O_CTL) |= (uint32_t)TIMER_CTL_TBEN;
+  hw_set_bit(timer_base + TIMER_O_CTL + 1, 0);
+}
+
+
+static inline void
+my_clear_timera_timeout_int(unsigned long timer_base)
+{
+  //HWREG(timer_base + TIMER_O_ICR) = TIMER_TIMA_TIMEOUT;
+  hw_set_bit(timer_base + TIMER_O_ICR, 0);
+}
+
+
+static inline void
+my_clear_timerb_timeout_int(unsigned long timer_base)
+{
+  //HWREG(timer_base + TIMER_O_ICR) = TIMER_TIMB_TIMEOUT;
+  hw_set_bit(timer_base + TIMER_O_ICR + 1, 0);
 }
 
 
@@ -752,16 +819,16 @@ IntHandlerSSI3(void)
 {
   uint32_t i;
 
-  ROM_TimerDisable(TIMER1_BASE, TIMER_A);
+  my_disable_timera(TIMER1_BASE);
 
   /*
     Check if a controller is connected.
     Could refine this check, but perhaps this is sufficient.
   */
-  if (RBIT(ps2_recvbuf[1]) == 0xff)
+  if (unlikely(ps2_recvbuf[1] == 0xff))
   {
     /* Clear any currently marked buttons. */
-    if (ps2_current_cmd_idx == sizeof(ps2_cmds)/sizeof(ps2_cmds[0]) - 1)
+    if (unlikely(ps2_current_cmd_idx == sizeof(ps2_cmds)/sizeof(ps2_cmds[0])-1))
     {
       ps2_button_state[0] = 0xff;
       ps2_button_state[1] = 0xff;
@@ -774,7 +841,7 @@ IntHandlerSSI3(void)
     /* Reset and start over config if a controller is connected later. */
     ps2_current_cmd_idx = 0;
   }
-  else if (ps2_current_cmd_idx == sizeof(ps2_cmds)/sizeof(ps2_cmds[0]) - 1)
+  else if (likely(ps2_current_cmd_idx == sizeof(ps2_cmds)/sizeof(ps2_cmds[0])-1))
   {
     /* Got a read, save it. */
     for (i = 0; i < 18; ++i)
@@ -800,7 +867,7 @@ IntHandlerTimer1B(void)
   uint32_t ps2_data_len;
   uint32_t idx;
 
-  ROM_TimerIntClear(TIMER1_BASE, TIMER_TIMB_TIMEOUT);
+  my_clear_timerb_timeout_int(TIMER1_BASE);
   if (ps2_dma_running)
     return;
 
@@ -825,7 +892,7 @@ IntHandlerTimer1B(void)
                              UDMA_MODE_BASIC, ps2_data,
                              (void *)(SSI3_BASE + SSI_O_DR), ps2_data_len);
   ROM_uDMAChannelEnable(UDMA_CH20_TIMER1A);
-  ROM_TimerEnable(TIMER1_BASE, TIMER_A);
+  my_enable_timera(TIMER1_BASE);
 }
 
 
@@ -1701,7 +1768,7 @@ timer2a_set_delay(uint32_t cycles, void (*cb)(void *), void *cb_data)
   timer2a_cb_data = cb_data;
   ROM_TimerLoadSet(TIMER2_BASE, TIMER_A, cycles);
   ROM_TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
-  ROM_TimerEnable(TIMER2_BASE, TIMER_A);
+  my_enable_timera(TIMER2_BASE);
 }
 
 
@@ -1710,8 +1777,8 @@ IntHandlerTimer2A(void)
 {
   void (*cb)(void *) = timer2a_cb;
 
-  ROM_TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
-  ROM_TimerDisable(TIMER2_BASE, TIMER_A);
+  my_clear_timera_timeout_int(TIMER2_BASE);
+  my_disable_timera(TIMER2_BASE);
   ROM_TimerIntDisable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
   if (cb)
   {

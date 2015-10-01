@@ -2267,10 +2267,13 @@ static uint32_t usb_sofar = 0;
   empty) whenever more than 0.2 seconds pass without any data received.
 
   Returns a true value if a reset was done, false if not.
+
+  The KEYS argument enables checking for button presses and returning them
+  as a fake packet.
 */
 static uint32_t
 usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
-               uint32_t *timeout_flag)
+               uint32_t *timeout_flag, uint32_t keys)
 {
   uint32_t reset = 0;
   uint32_t sofar = 0;
@@ -2306,10 +2309,10 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
         }
       }
 
-      /* Every 2 milliseconds, read the buttons. */
+      /* Every 4 milliseconds, read the buttons. */
       cur_time = get_time();
       if (last_button_time == 0xffffffff ||
-          calc_time_from_val(last_button_time, cur_time) > MCU_HZ/500 ||
+          calc_time_from_val(last_button_time, cur_time) > MCU_HZ/250 ||
           (keydata_sofar > 0 && !transmit_running))
       {
         last_button_time = cur_time;
@@ -2324,7 +2327,9 @@ usb_get_packet(uint8_t *packet_buf, uint32_t max_reset_count,
 #endif
 
         /* Only if not sending framebuffer data, and no partial usb packet */
-        if (transmit_running != TRANSMIT_RUNNING_FRAMEDATA && usb_sofar == 0)
+        if (keys &&
+            (transmit_running != TRANSMIT_RUNNING_FRAMEDATA) &&
+            usb_sofar == 0)
         {
           int diff = memcmp(button_status, prev_button_status, sizeof(button_status));
           /*
@@ -2537,7 +2542,7 @@ handle_cmd_debug(uint8_t *packet)
     nrf_transmit_packet_nack(packet);
     delay_us(40000);
     /* Grab the next packet for the bootloader. */
-    usb_get_packet(packet, usb_timeout_seconds*5, &usb_timeout);
+    usb_get_packet(packet, usb_timeout_seconds*5, &usb_timeout, 0);
   }
 
   nrf_config_bootload_tx(NRF_SSI_BASE, NRF_CSN_BASE, NRF_CSN_PIN);
@@ -2617,7 +2622,7 @@ handle_cmd_debug(uint8_t *packet)
       usb_data_put((const unsigned char *)"OK\r\n", 4);
 
     /* Get the next command over USB from the programmer. */
-    usb_get_packet(packet, usb_timeout_seconds*5, &usb_timeout);
+    usb_get_packet(packet, usb_timeout_seconds*5, &usb_timeout, 0);
   }
   if (usb_timeout)
   {
@@ -2757,7 +2762,7 @@ int main()
     uint8_t usb_packet[NRF_PACKET_SIZE];
 
     /* Wait for a packet on the USB. */
-    if (usb_get_packet(usb_packet, 0, NULL))
+    if (usb_get_packet(usb_packet, 0, NULL, 1))
     {
       /*
         If we had a resync on the USB, then reset the frame packet count.

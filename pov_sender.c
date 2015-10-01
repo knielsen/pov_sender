@@ -2153,6 +2153,13 @@ start_motor(void)
 }
 
 
+static inline uint32_t
+my_gpio_read(unsigned long gpio_base, uint8_t bits)
+{
+  return HWREG(gpio_base + GPIO_O_DATA + ((uint32_t)bits <<2));
+}
+
+
 /*
   Status of all buttons.
 
@@ -2214,12 +2221,12 @@ check_buttons(void)
 {
   uint8_t combined_status;
   uint32_t ps2_but_status1, ps2_but_status2;
-  long pa = ROM_GPIOPinRead(GPIO_PORTA_BASE, 0x7c);
-  long pb = ROM_GPIOPinRead(GPIO_PORTB_BASE, 0xf0);
-  long pc = ROM_GPIOPinRead(GPIO_PORTC_BASE, 0xf0);
-  long pd = ROM_GPIOPinRead(GPIO_PORTD_BASE, 0xcf);
-  long pe = ROM_GPIOPinRead(GPIO_PORTE_BASE, 0x3c);
-  long pf = ROM_GPIOPinRead(GPIO_PORTF_BASE, 0x10);
+  long pa = my_gpio_read(GPIO_PORTA_BASE, 0x7c);
+  long pb = my_gpio_read(GPIO_PORTB_BASE, 0xf0);
+  long pc = my_gpio_read(GPIO_PORTC_BASE, 0xf0);
+  long pd = my_gpio_read(GPIO_PORTD_BASE, 0xcf);
+  long pe = my_gpio_read(GPIO_PORTE_BASE, 0x3c);
+  long pf = my_gpio_read(GPIO_PORTF_BASE, 0x10);
   uint32_t status = ((pa >> 2) & 0x1f) | ((pc << 1) & 0xe0) |
     (((pb >> 4) & 0x0d) | ((pe >> 1) & 0x02) | ((pc >> 3) & 0x10) |
      ((pf << 1) & 0x20) | ((pd >> 1) & 0x40) | ((pe << 4) & 0x80)) << 8 |

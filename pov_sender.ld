@@ -36,22 +36,25 @@ SECTIONS
         KEEP(*(.isr_vector))
         *(.text*)
         *(.rodata*)
+        . = ALIGN(4);
         _etext = .;
     } > FLASH
 
-    .data : AT(ADDR(.text) + SIZEOF(.text))
+    .data :
     {
         _data = .;
         *(vtable)
         *(.data*)
+        . = ALIGN(4);
         _edata = .;
-    } > SRAM
+    } > SRAM AT > FLASH
 
     .bss :
     {
         _bss = .;
         *(.bss*)
         *(COMMON)
+        . = ALIGN(4);
         _ebss = .;
     } > SRAM
 }

@@ -1,26 +1,25 @@
 TARGET=pov_sender
 
-GCCDIR=/home/knielsen/devel/study/stellaris-arm/install
 SWDIR=/home/knielsen/devel/study/stellaris-arm/SW-EK-LM4F120XL-9453
 
 BINDIR=$(GCCDIR)/bin
 CC=arm-none-eabi-gcc
-LD=arm-none-eabi-ld
+LD=arm-none-eabi-gcc
 OBJCOPY=arm-none-eabi-objcopy
 LM4FLASH=lm4flash
 
 STARTUP=startup_gcc
 LINKSCRIPT=$(TARGET).ld
 
-FP_LDFLAGS= -L$(GCCDIR)/arm-none-eabi/lib/thumb/cortex-m4 -lm -L$(GCCDIR)/lib/gcc/arm-none-eabi/4.6.2/thumb/cortex-m4 -lgcc -lc
+FP_LDFLAGS= -lm -lgcc -lc
 
-ARCH_CFLAGS=-mthumb -mcpu=cortex-m4 -ffunction-sections -fdata-sections -DTARGET_IS_BLIZZARD_RA1
+ARCH_CFLAGS=-mthumb -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -ffunction-sections -fdata-sections -ffast-math -DTARGET_IS_BLIZZARD_RA1
 # LM4F120H5QR corresponds to TM4C1233H6PM. LM4F131H5QR corresponds to TM4C1236H6PM.
 # LM4F121H5QR corresponds to TM4C1232H6PM
 #INC=-I$(SWDIR) -DPART_LM4F120H5QR
 INC=-I$(SWDIR) -DPART_LM4F131H5QR
 CFLAGS=-Dgcc -g -O3  -std=c99 -Wall -pedantic $(ARCH_CFLAGS) $(INC)
-LDFLAGS=--entry ResetISR --gc-sections
+LDFLAGS=--entry ResetISR -Wl,--gc-sections
 
 VPATH=$(SWDIR)/boards/ek-lm4f120xl/drivers
 VPATH+=$(SWDIR)/utils
@@ -33,7 +32,7 @@ all: $(TARGET).bin
 $(TARGET).bin: $(TARGET).elf
 
 $(TARGET).elf: $(OBJS) $(STARTUP).o $(LINKSCRIPT)
-	$(LD) $(LDFLAGS) -T $(LINKSCRIPT) -o $@ $(STARTUP).o $(OBJS) $(LIBS) $(FP_LDFLAGS)
+	$(LD) $(CFLAGS) $(LDFLAGS) -T $(LINKSCRIPT) -o $@ $(STARTUP).o $(OBJS) $(LIBS) $(FP_LDFLAGS)
 
 $(TARGET).o: $(TARGET).c usb_serial_structs.h
 usb_serial_structs.o: usb_serial_structs.c usb_serial_structs.h
@@ -53,9 +52,9 @@ clean:
 	rm -f $(OBJS) $(TARGET).elf $(TARGET).bin $(STARTUP).o
 
 tty:
-	stty -F/dev/ttyACM0 raw -echo -hup cs8 -parenb -cstopb 500000
+	stty -F/dev/pov_sender raw -echo -hup cs8 -parenb -cstopb 500000
 
 cat:
-	cat /dev/ttyACM0
+	cat /dev/pov_sender
 
 .PHONY: all clean flash tty cat
